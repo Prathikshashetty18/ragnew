@@ -2,48 +2,11 @@ import React, { useState, useRef, useEffect } from "react";
 import { 
   Send, Sparkles, Paperclip, ShieldCheck, 
   Copy, Check, BookOpen, User, FileText, 
-  Layers, Info, ArrowRight, Cpu, RefreshCw, PanelLeft
+  Layers, Info, ArrowRight, Cpu, RefreshCw, PanelLeft,
+  Mic, MicOff, Scale
 } from "lucide-react";
-
-interface Evidence {
-  pdf_name: string;
-  page_number: number;
-  supporting_text: string;
-  response_sentence?: string;
-}
-
-interface VerificationResult {
-  sentence: string;
-  status: string;
-  score: number;
-  source_sentence?: string;
-  pdf_name?: string;
-  page_number?: number;
-}
-
-interface Message {
-  id: string;
-  role: "user" | "assistant" | string;
-  content: string;
-  confidence_level?: string;
-  confidence_score?: number;
-  evidence?: Evidence[];
-  verification_results?: VerificationResult[];
-  created_at: string;
-}
-
-interface Patient {
-  id: string;
-  name: string;
-}
-
-interface Document {
-  id: number;
-  name: string;
-  status: string;
-  chunk_count: number;
-  scope: string;
-}
+import { MarkdownRenderer } from "./MarkdownRenderer";
+import type { Message, Patient, Document } from "../types";
 
 interface ChatAreaProps {
   messages: Message[];
@@ -54,7 +17,7 @@ interface ChatAreaProps {
   onToggleSidebar: () => void;
   onInspectSentence: (sentence: any | null) => void;
   activeInspectedSentence?: any | null;
-  onUploadFile: (file: File, scope: string, patientId?: string) => Promise<void>;
+  onUploadFile: (file: File, scope: string, patientId?: string) => Promise<any>;
   patients: Patient[];
   documents?: Document[];
   initialQuery?: string;
@@ -78,10 +41,59 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [verifyModeMap, setVerifyModeMap] = useState<Record<string, boolean>>({});
   const [copiedMap, setCopiedMap] = useState<Record<string, boolean>>({});
   const [isUploading, setIsUploading] = useState(false);
+  
+  const [isListening, setIsListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const recognitionRef = useRef<any>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event: any) => {
+        const transcript = Array.from(event.results)
+          .map((r: any) => r[0].transcript)
+          .join("");
+        setInputText(transcript);
+      };
+
+      recognition.onerror = (event: any) => {
+        console.error("Speech recognition error:", event.error);
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+    } else {
+      setSpeechSupported(false);
+    }
+  }, []);
+
+  const toggleVoiceInput = () => {
+    if (!recognitionRef.current) return;
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  };
 
   useEffect(() => {
     if (initialQuery) {
@@ -101,6 +113,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const handleSend = () => {
     if (!inputText.trim() || isLoading) return;
+
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
 
     const filters: any = { scope };
     if (scope === "patient" || scope === "patient_and_kb") {
@@ -159,14 +176,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   };
 
   const suggestedFollowUps = [
-    "What are the alternate antibiotic choices for penicillin-allergic patients?",
-    "What is the recommended follow-up timeline for this condition?",
-    "What criteria determine safe hospital discharge for pneumonia?"
+    "What is the first-line antimicrobial regimen for community-acquired pneumonia as per hospital guidelines?",
+    "What are the diagnostic criteria and molecular workup for suspected active pulmonary tuberculosis?",
+    "What criteria determine safe hospital discharge for inpatient pneumonia management?"
   ];
 
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-50 relative overflow-hidden">
-      {/* Top Bar: Scoping & Engine Controls */}
       <header className="px-6 py-3.5 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0 shadow-2xs z-10">
         <div className="flex items-center space-x-3">
           {!isSidebarOpen && (
@@ -179,7 +195,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           )}
 
           <div className="flex items-center space-x-2">
-            <span className="text-xs font-bold text-slate-900">Retrieval Scope:</span>
+            <span className="text-xs font-bold text-slate-900">Scope:</span>
             <div className="flex bg-slate-100 p-1 rounded-xl text-xs font-semibold">
               <button
                 type="button"
@@ -250,7 +266,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           )}
         </div>
 
-        {/* Strict RAG vs Direct LLM Mode Switch */}
         <div className="flex items-center space-x-2">
           <span className="text-xs font-medium text-slate-500">Mode:</span>
           <button
@@ -263,12 +278,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             }`}
           >
             <Cpu className="w-3.5 h-3.5" />
-            <span>{directLlm ? "Direct LLM (Unverified)" : "Strict RAG (Verified)"}</span>
+            <span>{directLlm ? "Direct LLM (Unverified)" : "Strict RAG (NLI Verified)"}</span>
           </button>
         </div>
       </header>
 
-      {/* Chat Messages Feed */}
       <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center max-w-xl mx-auto space-y-4 my-auto py-12">
@@ -277,10 +291,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
             <div className="space-y-1">
               <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
-                Clinical AI Decision Support
+                Clinical Decision Support Assistant
               </h2>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Ask questions regarding patient diagnostics, antibiotic therapy guidelines, clinical management, and lab evaluations grounded directly in authorized hospital records.
+                Ask clinical diagnostics, antibiotic therapy, lab interpretations, and patient care questions grounded in verified hospital guidelines.
               </p>
             </div>
 
@@ -311,7 +325,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 msg.role === "user" ? "items-end" : "items-start"
               } space-y-2`}
             >
-              {/* Message Header */}
               <div className="flex items-center space-x-2 text-xs text-slate-500 px-1">
                 <span className="font-bold text-slate-700">
                   {msg.role === "user" ? "You (Clinician)" : "Clinical Decision Assistant"}
@@ -320,7 +333,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <span>{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
 
-              {/* Message Box */}
               <div
                 className={`max-w-3xl rounded-2xl p-5 shadow-xs leading-relaxed text-sm ${
                   msg.role === "user"
@@ -328,15 +340,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     : "bg-white text-slate-900 border border-slate-200 space-y-4"
                 }`}
               >
-                {/* Content */}
                 <div className="whitespace-pre-wrap">
-                  {msg.content}
+                  {msg.role === "assistant" ? (
+                    <MarkdownRenderer content={msg.content} />
+                  ) : (
+                    msg.content
+                  )}
                 </div>
 
-                {/* Assistant RAG Metadata Badges */}
                 {msg.role === "assistant" && (
                   <div className="space-y-4 pt-3 border-t border-slate-100">
-                    {/* Confidence & Verification Status Bar */}
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center space-x-2">
                         {msg.confidence_level && (
@@ -357,8 +370,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             onClick={() => toggleVerifyMode(msg.id)}
                             className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition-colors flex items-center space-x-1 cursor-pointer"
                           >
-                            <Info className="w-3.5 h-3.5 text-blue-600" />
-                            <span>{verifyModeMap[msg.id] ? "Hide Verification" : "Inspect Sentence Verification"}</span>
+                            <Scale className="w-3.5 h-3.5 text-blue-600" />
+                            <span>{verifyModeMap[msg.id] ? "Hide NLI Audit" : "Inspect NLI Verification"}</span>
                           </button>
                         )}
                       </div>
@@ -372,12 +385,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       </button>
                     </div>
 
-                    {/* Sentence Verification Inspection Drawer */}
                     {verifyModeMap[msg.id] && msg.verification_results && (
                       <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5 animate-fadeIn">
                         <div className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center space-x-1.5">
-                          <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                          <span>Sentence-Level Fact Verification</span>
+                          <Scale className="w-4 h-4 text-blue-600" />
+                          <span>Natural Language Inference (NLI) Grounding Audit</span>
                         </div>
                         <div className="space-y-2">
                           {msg.verification_results.map((vr, idx) => (
@@ -388,9 +400,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             >
                               <div className="flex items-center justify-between">
                                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                  vr.status === "Supported" ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800"
+                                  vr.nli_label === "Entailment" ? "bg-emerald-100 text-emerald-800" :
+                                  vr.nli_label === "Contradiction" ? "bg-red-100 text-red-800" :
+                                  "bg-amber-100 text-amber-800"
                                 }`}>
-                                  {vr.status} (Score: {Math.round(vr.score * 100)}%)
+                                  {vr.nli_label || vr.status} (Similarity: {Math.round(vr.score * 100)}%)
                                 </span>
                                 {vr.pdf_name && (
                                   <span className="text-[10px] text-slate-500 font-mono">
@@ -398,10 +412,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                                   </span>
                                 )}
                               </div>
-                              <p className="text-slate-800 font-medium">{vr.sentence}</p>
+                              <p className="text-slate-800 font-medium">"{vr.sentence}"</p>
                               {vr.source_sentence && (
                                 <p className="text-[11px] text-slate-500 italic bg-slate-50 p-1.5 rounded">
-                                  Source: "{vr.source_sentence}"
+                                  Evidence Premise: "{vr.source_sentence}"
+                                </p>
+                              )}
+                              {vr.explanation && (
+                                <p className="text-[10px] text-slate-400">
+                                  {vr.explanation}
                                 </p>
                               )}
                             </div>
@@ -410,22 +429,26 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       </div>
                     )}
 
-                    {/* Retrieved Evidence & Source Citations */}
                     {msg.evidence && msg.evidence.length > 0 && (
                       <div className="bg-blue-50/50 p-4 rounded-xl border border-blue-100 space-y-2">
                         <div className="text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center space-x-1.5">
                           <BookOpen className="w-3.5 h-3.5 text-blue-600" />
-                          <span>Retrieved Evidence & Citations</span>
+                          <span>Retrieved Grounding Evidence ({msg.evidence.length})</span>
                         </div>
                         <div className="space-y-2">
                           {msg.evidence.map((ev, idx) => (
                             <div key={idx} className="p-2.5 bg-white border border-blue-200/80 rounded-lg text-xs space-y-1">
                               <div className="flex items-center justify-between text-blue-800 font-bold text-[11px]">
-                                <span className="flex items-center space-x-1">
-                                  <FileText className="w-3.5 h-3.5 text-blue-600" />
-                                  <span>{ev.pdf_name}</span>
+                                <span className="flex items-center space-x-1.5 truncate max-w-sm">
+                                  <FileText className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                                  <span className="truncate">{ev.pdf_name}</span>
+                                  {ev.version && (
+                                    <span className="bg-blue-50 text-blue-600 border border-blue-200 px-1 rounded text-[9px] font-mono">
+                                      {ev.version}
+                                    </span>
+                                  )}
                                 </span>
-                                <span className="font-mono bg-blue-100 px-1.5 py-0.5 rounded text-[10px]">
+                                <span className="font-mono bg-blue-100 px-1.5 py-0.5 rounded text-[10px] shrink-0">
                                   Page {ev.page_number}
                                 </span>
                               </div>
@@ -449,7 +472,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <RefreshCw className="w-5 h-5 text-blue-600 animate-spin" />
             <div className="space-y-1">
               <span className="text-xs font-bold text-slate-800">RAG Pipeline Executing...</span>
-              <p className="text-[11px] text-slate-500">FAISS + BM25 Hybrid Retrieval & Cross-Encoder Reranking</p>
+              <p className="text-[11px] text-slate-500">FAISS + BM25 Hybrid Retrieval, Reranking & NLI Verification</p>
             </div>
           </div>
         )}
@@ -457,7 +480,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         <div ref={chatEndRef} />
       </div>
 
-      {/* Input Area */}
       <footer className="p-4 md:p-6 bg-white border-t border-slate-200 space-y-2 shrink-0">
         <input
           type="file"
@@ -467,16 +489,31 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           className="hidden"
         />
 
-        <div className="relative flex items-center bg-slate-50 border border-slate-300 focus-within:border-blue-600 focus-within:bg-white focus-within:ring-2 focus-within:ring-blue-100 rounded-2xl transition-all shadow-2xs">
+        <div className={`relative flex items-center bg-slate-50 border rounded-2xl transition-all shadow-2xs ${
+          isListening ? "border-red-500 ring-2 ring-red-100 bg-red-50/20" : "border-slate-300 focus-within:border-blue-600 focus-within:bg-white focus-within:ring-2 focus-within:ring-blue-100"
+        }`}>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={isUploading}
-            title="Upload personal PDF for this session"
+            title="Upload PDF for this session"
             className="p-3 text-slate-400 hover:text-blue-600 transition-colors cursor-pointer disabled:opacity-50"
           >
             {isUploading ? <RefreshCw className="w-5 h-5 animate-spin text-blue-600" /> : <Paperclip className="w-5 h-5" />}
           </button>
+
+          {speechSupported && (
+            <button
+              type="button"
+              onClick={toggleVoiceInput}
+              title={isListening ? "Stop Voice Input" : "Click to Speak (Voice Input)"}
+              className={`p-3 transition-colors cursor-pointer ${
+                isListening ? "text-red-600 animate-pulse" : "text-slate-400 hover:text-blue-600"
+              }`}
+            >
+              {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+            </button>
+          )}
 
           <textarea
             ref={inputRef}
@@ -488,7 +525,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               e.target.style.height = `${Math.min(e.target.scrollHeight, 140)}px`;
             }}
             onKeyDown={handleKeyDown}
-            placeholder="Ask Clinical AI a question or request treatment guidance..."
+            placeholder={isListening ? "Listening... Speak your clinical query..." : "Ask Clinical AI or request treatment protocol guidance..."}
             className="flex-1 bg-transparent py-3 px-2 text-sm text-slate-900 placeholder:text-slate-400 outline-none resize-none max-h-36"
           />
 
@@ -505,7 +542,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
           <span className="flex items-center space-x-1">
             <Info className="w-3 h-3 text-blue-500" />
-            <span>Clinical decision-support tool. Always verify with primary hospital clinical protocols.</span>
+            <span>Clinical decision-support aid. Grounded in hospital guidelines with sentence NLI verification.</span>
           </span>
           <span className="hidden sm:inline">Press <kbd className="font-mono bg-slate-100 px-1 rounded">Enter</kbd> to send</span>
         </div>

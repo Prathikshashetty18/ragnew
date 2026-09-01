@@ -1,44 +1,74 @@
 import json
 import uuid
+import hashlib
+import secrets
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from app.config import DATABASE_URL
 
 # Setup SQLAlchemy engine and session
-# For SQLite, we allow multithreading access
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+def hash_pw_seed(password: str) -> str:
+    salt = secrets.token_hex(16)
+    iterations = 100000
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations, dklen=32)
+    return f"pbkdf2_sha256${iterations}${salt}${key.hex()}"
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
-    role = Column(String(50), nullable=False)  # doctor, nurse, radiologist, laboratory, intern
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False)  # ADMIN, DOCTOR, FRONT_DESK, INTERN, NURSE, OTHER_STAFF
     name = Column(String(100), nullable=False)
+    email = Column(String(150), nullable=True)
+    employee_id = Column(String(50), nullable=True)
+    department = Column(String(100), nullable=True)
+    status = Column(String(50), default="ACTIVE")  # ACTIVE, INACTIVE
+    must_change_password = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    assigned_patients = relationship("Patient", back_populates="assigned_doctor")
+    assigned_patients = relationship("Patient", foreign_keys="Patient.assigned_doctor_id", back_populates="assigned_doctor")
+    created_patients = relationship("Patient", foreign_keys="Patient.created_by", back_populates="creator")
 
 class Patient(Base):
     __tablename__ = "patients"
 
-    id = Column(String(50), primary_key=True, index=True)
+    id = Column(String(50), primary_key=True, index=True)  # e.g., PAT-2026-000101
     name = Column(String(100), nullable=False)
     age = Column(Integer, nullable=False)
+    dob = Column(String(50), nullable=True)
     gender = Column(String(20), nullable=False)
+    blood_group = Column(String(10), nullable=True)
+    contact_details = Column(Text, nullable=True)
+    department = Column(String(100), default="General Medicine")
     health_status = Column(String(100), default="Under Review")
+    status = Column(String(50), default="ACTIVE")  # ACTIVE, DISCHARGED, ARCHIVED, DELETED
+    
     assigned_doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    admission_date = Column(DateTime, default=datetime.utcnow)
+    discharge_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    assigned_doctor = relationship("User", back_populates="assigned_patients")
+    assigned_doctor = relationship("User", foreign_keys=[assigned_doctor_id], back_populates="assigned_patients")
+    creator = relationship("User", foreign_keys=[created_by], back_populates="created_patients")
+    
     vitals = relationship("PatientVitals", back_populates="patient", cascade="all, delete-orphan")
     lab_results = relationship("LabResult", back_populates="patient", cascade="all, delete-orphan")
     radiology_reports = relationship("RadiologyReport", back_populates="patient", cascade="all, delete-orphan")
     clinical_notes = relationship("ClinicalNote", back_populates="patient", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="patient", cascade="all, delete-orphan")
+    reports = relationship("ClinicalReport", back_populates="patient", cascade="all, delete-orphan")
 
 class PatientVitals(Base):
     __tablename__ = "patient_vitals"
@@ -65,6 +95,7 @@ class LabResult(Base):
     hemoglobin = Column(Float, nullable=True)
     wbc = Column(Integer, nullable=True)
     crp = Column(String(50), nullable=True)
+    platelets = Column(Integer, nullable=True)
     notes = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -97,6 +128,43 @@ class ClinicalNote(Base):
     patient = relationship("Patient", back_populates="clinical_notes")
     author = relationship("User")
 
+class ClinicalReport(Base):
+    __tablename__ = "clinical_reports"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    patient_id = Column(String(50), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
+    doctor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(255), nullable=False)
+    chief_complaint = Column(Text, nullable=True)
+    clinical_history = Column(Text, nullable=True)
+    observations = Column(Text, nullable=True)
+    investigations = Column(Text, nullable=True)
+    clinical_assessment = Column(Text, nullable=True)
+    relevant_evidence = Column(Text, nullable=True)
+    recommendations = Column(Text, nullable=True)
+    sources = Column(Text, nullable=True)
+    status = Column(String(50), default="AI-GENERATED DRAFT")  # AI-GENERATED DRAFT, APPROVED, ARCHIVED
+    created_at = Column(DateTime, default=datetime.utcnow)
+    approved_at = Column(DateTime, nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    patient = relationship("Patient", back_populates="reports")
+    doctor = relationship("User", foreign_keys=[doctor_id])
+    approver = relationship("User", foreign_keys=[approved_by])
+
+class TrustedSource(Base):
+    __tablename__ = "trusted_sources"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    domain = Column(String(200), nullable=False)
+    source_type = Column(String(100), default="guideline")  # guideline, textbook, research_paper, institutional
+    approval_status = Column(String(50), default="APPROVED")  # APPROVED, PENDING, REJECTED
+    institution_approved = Column(Boolean, default=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -104,18 +172,37 @@ class Document(Base):
     name = Column(String(255), unique=True, nullable=False)
     file_path = Column(String(512), nullable=False)
     status = Column(String(50), default="processing")  # processing, completed, failed
+    approval_status = Column(String(50), default="ACTIVE")  # PENDING, APPROVED, ACTIVE, FLAGGED, ARCHIVED, DELETED
+    version = Column(String(50), default="1.0")
+    medical_relevance_score = Column(Float, nullable=True)
+    hash_md5 = Column(String(64), nullable=True)
     chunk_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Scope metadata
     scope = Column(String(50), default="knowledge_base")  # knowledge_base, patient, temporary
     patient_id = Column(String(50), ForeignKey("patients.id", ondelete="CASCADE"), nullable=True)
     uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     uploader_role = Column(String(50), nullable=True)
-    document_type = Column(String(100), nullable=True)  # blood_report, radiology_report, nursing_report, medical_history, other
+    document_type = Column(String(100), nullable=True)  # guideline, textbook, research_paper, blood_report, radiology_report, nursing_report, medical_history, other
 
     patient = relationship("Patient", back_populates="documents")
     uploader = relationship("User")
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_name = Column(String(100), nullable=True)
+    user_role = Column(String(50), nullable=True)
+    action = Column(String(100), nullable=False)
+    resource_type = Column(String(100), nullable=False)
+    resource_id = Column(String(100), nullable=True)
+    status = Column(String(50), default="SUCCESS")  # SUCCESS, FAILURE, DENIED
+    details = Column(Text, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
@@ -171,62 +258,225 @@ class ChatMessage(Base):
     def verification_results(self, value):
         self._verification_results = json.dumps(value)
 
-# Database initialization helper
 def init_db():
     Base.metadata.create_all(bind=engine)
-    
-    # Seed fictional demo users and patients if table is empty
     db = SessionLocal()
     try:
-        # Check if users are empty
-        if db.query(User).count() == 0:
-            print("Seeding database with fictional demo users...")
+        # Seed users if admin is missing
+        if db.query(User).filter(User.username == "admin").count() == 0:
+            print("Seeding database with Hospital Admin and Professional Staff accounts...")
             users = [
-                User(id=1, username="arun", role="doctor", name="Dr. Arun"),
-                User(id=2, username="meera", role="doctor", name="Dr. Meera"),
-                User(id=3, username="priya", role="nurse", name="Priya"),
-                User(id=4, username="rahul_rad", role="radiologist", name="Rahul"),
-                User(id=5, username="ananya_lab", role="laboratory", name="Ananya"),
-                User(id=6, username="arjun_intern", role="intern", name="Arjun"),
+                User(
+                    username="admin",
+                    password_hash=hash_pw_seed("Admin@123"),
+                    role="ADMIN",
+                    name="Hospital Administrator",
+                    email="admin@hospital.org",
+                    employee_id="EMP-ADM-001",
+                    department="Administration",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="arun",
+                    password_hash=hash_pw_seed("Doctor@123"),
+                    role="DOCTOR",
+                    name="Dr. Arun",
+                    email="arun@hospital.org",
+                    employee_id="EMP-DOC-101",
+                    department="Internal Medicine",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="meera",
+                    password_hash=hash_pw_seed("Doctor@123"),
+                    role="DOCTOR",
+                    name="Dr. Meera",
+                    email="meera@hospital.org",
+                    employee_id="EMP-DOC-102",
+                    department="Cardiology",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="frontdesk",
+                    password_hash=hash_pw_seed("Front@123"),
+                    role="FRONT_DESK",
+                    name="Sarah (Front Desk)",
+                    email="frontdesk@hospital.org",
+                    employee_id="EMP-FD-201",
+                    department="Patient Registration",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="priya",
+                    password_hash=hash_pw_seed("Nurse@123"),
+                    role="NURSE",
+                    name="Priya (Staff Nurse)",
+                    email="priya@hospital.org",
+                    employee_id="EMP-NUR-301",
+                    department="Inpatient Ward",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="arjun_intern",
+                    password_hash=hash_pw_seed("Intern@123"),
+                    role="INTERN",
+                    name="Arjun (Resident Intern)",
+                    email="arjun@hospital.org",
+                    employee_id="EMP-INT-601",
+                    department="Internal Medicine",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="rahul_rad",
+                    password_hash=hash_pw_seed("Staff@123"),
+                    role="OTHER_STAFF",
+                    name="Rahul (Radiologist)",
+                    email="rahul@hospital.org",
+                    employee_id="EMP-RAD-401",
+                    department="Radiology",
+                    status="ACTIVE"
+                ),
+                User(
+                    username="ananya_lab",
+                    password_hash=hash_pw_seed("Staff@123"),
+                    role="OTHER_STAFF",
+                    name="Ananya (Lab Tech)",
+                    email="ananya@hospital.org",
+                    employee_id="EMP-LAB-501",
+                    department="Pathology",
+                    status="ACTIVE"
+                ),
             ]
             for u in users:
-                db.add(u)
+                existing = db.query(User).filter(User.username == u.username).first()
+                if not existing:
+                    db.add(u)
+                else:
+                    # Update password hash and status if needed
+                    existing.password_hash = u.password_hash
+                    existing.role = u.role
+                    existing.status = u.status
             db.commit()
 
-        # Check if patients are empty
+        # Seed Trusted Sources
+        if db.query(TrustedSource).count() == 0:
+            sources = [
+                TrustedSource(name="World Health Organization (WHO)", domain="who.int", source_type="guideline", approval_status="APPROVED", institution_approved=True),
+                TrustedSource(name="Centers for Disease Control and Prevention (CDC)", domain="cdc.gov", source_type="guideline", approval_status="APPROVED", institution_approved=True),
+                TrustedSource(name="National Library of Medicine (NIH/NLM)", domain="nih.gov", source_type="research_paper", approval_status="APPROVED", institution_approved=True),
+                TrustedSource(name="Infectious Diseases Society of America (IDSA)", domain="idsociety.org", source_type="guideline", approval_status="APPROVED", institution_approved=True),
+            ]
+            for s in sources:
+                db.add(s)
+            db.commit()
+
+        # Seed Initial Patients if empty
         if db.query(Patient).count() == 0:
-            print("Seeding database with fictional patients...")
+            print("Seeding initial patient records...")
+            doc_arun = db.query(User).filter(User.username == "arun").first()
+            doc_meera = db.query(User).filter(User.username == "meera").first()
+            admin_user = db.query(User).filter(User.username == "admin").first()
+            
             patients = [
-                Patient(id="P001", name="Rahul", age=45, gender="M", health_status="Under Review", assigned_doctor_id=1),
-                Patient(id="P002", name="Ananya", age=32, gender="F", health_status="Stable", assigned_doctor_id=1),
-                Patient(id="P003", name="Arjun", age=28, gender="M", health_status="Discharged", assigned_doctor_id=2),
-                Patient(id="P004", name="Meera", age=61, gender="F", health_status="Admitted", assigned_doctor_id=2),
+                Patient(
+                    id="PAT-2026-000101",
+                    name="Rahul Sharma",
+                    age=45,
+                    gender="Male",
+                    dob="1981-05-12",
+                    blood_group="O+",
+                    contact_details="+91 98765 43210, Bangalore",
+                    department="Pulmonology",
+                    health_status="Under Review",
+                    status="ACTIVE",
+                    assigned_doctor_id=doc_arun.id if doc_arun else None,
+                    created_by=admin_user.id if admin_user else None
+                ),
+                Patient(
+                    id="PAT-2026-000102",
+                    name="Ananya Verma",
+                    age=32,
+                    gender="Female",
+                    dob="1994-08-22",
+                    blood_group="A+",
+                    contact_details="+91 98111 22233, Mumbai",
+                    department="Internal Medicine",
+                    health_status="Stable",
+                    status="ACTIVE",
+                    assigned_doctor_id=doc_arun.id if doc_arun else None,
+                    created_by=admin_user.id if admin_user else None
+                ),
+                Patient(
+                    id="PAT-2026-000103",
+                    name="Arjun Rao",
+                    age=28,
+                    gender="Male",
+                    dob="1998-03-15",
+                    blood_group="B+",
+                    contact_details="+91 97444 55566, Hyderabad",
+                    department="Cardiology",
+                    health_status="Discharged",
+                    status="DISCHARGED",
+                    assigned_doctor_id=doc_meera.id if doc_meera else None,
+                    created_by=admin_user.id if admin_user else None
+                ),
+                Patient(
+                    id="PAT-2026-000104",
+                    name="Meera Nair",
+                    age=61,
+                    gender="Female",
+                    dob="1965-11-04",
+                    blood_group="AB+",
+                    contact_details="+91 99888 77665, Chennai",
+                    department="Cardiology",
+                    health_status="Admitted",
+                    status="ACTIVE",
+                    assigned_doctor_id=doc_meera.id if doc_meera else None,
+                    created_by=admin_user.id if admin_user else None
+                )
             ]
             for p in patients:
                 db.add(p)
             db.commit()
-            
-            # Initial vitals for P001 recorded by Priya (nurse, user id 3)
-            if db.query(PatientVitals).count() == 0:
+
+            # Seed vitals for PAT-2026-000101 recorded by Priya
+            nurse = db.query(User).filter(User.username == "priya").first()
+            if nurse:
                 vitals = PatientVitals(
-                    patient_id="P001",
-                    recorded_by=3,
+                    patient_id="PAT-2026-000101",
+                    recorded_by=nurse.id,
                     blood_pressure="145/90",
                     pulse=98,
                     temperature=37.8,
                     spo2=98,
-                    notes="Mild fever, blood pressure slightly elevated.",
+                    notes="Mild fever, blood pressure slightly elevated. Mild right sided chest pain on inspiration.",
                     timestamp=datetime.utcnow()
                 )
                 db.add(vitals)
                 db.commit()
+
+            # Seed lab result for PAT-2026-000101 recorded by Ananya
+            lab_tech = db.query(User).filter(User.username == "ananya_lab").first()
+            if lab_tech:
+                labs = LabResult(
+                    patient_id="PAT-2026-000101",
+                    recorded_by=lab_tech.id,
+                    hemoglobin=10.2,
+                    wbc=14000,
+                    crp="48.5 mg/L",
+                    platelets=280000,
+                    notes="Marked leukocytosis with elevated CRP (48.5 mg/L). Acute bacterial infection likely.",
+                    timestamp=datetime.utcnow()
+                )
+                db.add(labs)
+                db.commit()
+
     except Exception as e:
         print(f"Error seeding database: {e}")
         db.rollback()
     finally:
         db.close()
 
-# Dependency to get db session
 def get_db():
     db = SessionLocal()
     try:

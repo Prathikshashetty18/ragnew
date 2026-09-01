@@ -6,60 +6,24 @@ import { PatientDashboard } from "./components/PatientDashboard";
 import { DashboardHome } from "./components/DashboardHome";
 import { DocumentLibrary } from "./components/DocumentLibrary";
 import { KnowledgeBaseView } from "./components/KnowledgeBaseView";
-import { Settings } from "lucide-react";
-
-interface User {
-  id: number;
-  username: string;
-  role: string;
-  name: string;
-}
-
-interface Patient {
-  id: string;
-  name: string;
-  age: number;
-  gender: string;
-  health_status: string;
-  assigned_doctor: string;
-}
-
-interface Document {
-  id: number;
-  name: string;
-  status: string;
-  chunk_count: number;
-  scope: string;
-  created_at: string;
-}
-
-interface Session {
-  id: string;
-  title: string;
-  created_at: string;
-}
-
-interface Message {
-  id: string;
-  role: "user" | "assistant" | string;
-  content: string;
-  confidence_level?: string;
-  confidence_score?: number;
-  evidence?: any[];
-  verification_results?: any[];
-  created_at: string;
-}
+import { ReportStudio } from "./components/ReportStudio";
+import { UserManagement } from "./components/UserManagement";
+import { AuditLogView } from "./components/AuditLogView";
+import type { UserProfile, Patient, Document, Session, Message } from "./types";
 
 const API_BASE = "http://127.0.0.1:8000";
-const API_KEY = "dev_secret_key_to_protect_endpoints";
 
 export const App: React.FC = () => {
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
     const saved = localStorage.getItem("cdss_user");
     return saved ? JSON.parse(saved) : null;
   });
 
-  const [activeScreen, setActiveScreen] = useState<"dashboard" | "clinical_ai" | "patients" | "documents" | "knowledge_base" | "settings">("dashboard");
+  const [token, setToken] = useState<string>(() => {
+    return localStorage.getItem("cdss_token") || "";
+  });
+
+  const [activeScreen, setActiveScreen] = useState<string>("dashboard");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -69,63 +33,48 @@ export const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
   const [inspectedSentence, setInspectedSentence] = useState<any | null>(null);
-  const [selectedPatientId, setSelectedPatientId] = useState<string>("");
+  const [reportPatientId, setReportPatientId] = useState<string>("");
   const [quickQuestion, setQuickQuestion] = useState<string>("");
 
-  // Save/Restore user
-  const handleLoginSuccess = (user: User) => {
+  const handleLoginSuccess = (user: UserProfile, accessToken: string) => {
     setCurrentUser(user);
+    setToken(accessToken);
     localStorage.setItem("cdss_user", JSON.stringify(user));
+    localStorage.setItem("cdss_token", accessToken);
     setActiveScreen("dashboard");
   };
 
   const handleLogout = () => {
     setCurrentUser(null);
+    setToken("");
     localStorage.removeItem("cdss_user");
+    localStorage.removeItem("cdss_token");
     setMessages([]);
     setSessions([]);
     setActiveSessionId(null);
   };
 
-  // Fetch initial hospital data
+  const authHeaders = {
+    Authorization: `Bearer ${token}`
+  };
+
   const fetchData = async () => {
-    if (!currentUser) return;
+    if (!currentUser || !token) return;
 
     try {
-      // 1. Fetch Patients
-      const pRes = await fetch(`${API_BASE}/api/patients`, {
-        headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
-        }
-      });
+      const pRes = await fetch(`${API_BASE}/api/patients`, { headers: authHeaders });
       if (pRes.ok) {
         const pData = await pRes.json();
         setPatients(pData);
-        if (pData.length > 0 && !selectedPatientId) {
-          setSelectedPatientId(pData[0].id);
-        }
       }
 
-      // 2. Fetch Documents
-      const dRes = await fetch(`${API_BASE}/api/documents`, {
-        headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
-        }
-      });
+      const dRes = await fetch(`${API_BASE}/api/documents`, { headers: authHeaders });
       if (dRes.ok) {
         const dData = await dRes.json();
         setDocuments(dData);
       }
 
-      // 3. Fetch Sessions
-      const sRes = await fetch(`${API_BASE}/api/sessions`, {
-        headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
-        }
-      });
+      const sRes = await fetch(`${API_BASE}/api/sessions`, { headers: authHeaders });
       if (sRes.ok) {
         const sData = await sRes.json();
         setSessions(sData);
@@ -139,22 +88,18 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
-    if (currentUser) {
+    if (currentUser && token) {
       fetchData();
     }
-  }, [currentUser]);
+  }, [currentUser, token]);
 
-  // Fetch messages when activeSessionId changes
   useEffect(() => {
-    if (!activeSessionId || !currentUser) return;
+    if (!activeSessionId || !currentUser || !token) return;
 
     const fetchSessionMessages = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/sessions/${activeSessionId}/messages`, {
-          headers: {
-            "X-API-Key": API_KEY,
-            "X-User-Id": currentUser.username
-          }
+          headers: authHeaders
         });
         if (res.ok) {
           const data = await res.json();
@@ -166,19 +111,17 @@ export const App: React.FC = () => {
     };
 
     fetchSessionMessages();
-  }, [activeSessionId, currentUser]);
+  }, [activeSessionId, currentUser, token]);
 
-  // Create new consultation session
   const handleCreateSession = async () => {
-    if (!currentUser) return;
+    if (!currentUser || !token) return;
 
     try {
       const res = await fetch(`${API_BASE}/api/sessions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
+          ...authHeaders
         },
         body: JSON.stringify({ title: "New Consultation" })
       });
@@ -193,18 +136,14 @@ export const App: React.FC = () => {
     }
   };
 
-  // Delete consultation session
   const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!currentUser) return;
+    if (!currentUser || !token) return;
 
     try {
       const res = await fetch(`${API_BASE}/api/sessions/${id}`, {
         method: "DELETE",
-        headers: {
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
-        }
+        headers: authHeaders
       });
       if (res.ok) {
         setSessions(prev => prev.filter(s => s.id !== id));
@@ -223,37 +162,33 @@ export const App: React.FC = () => {
     }
   };
 
-  // Upload file
-  const handleUploadFile = async (file: File, scope: string, patientId?: string) => {
-    if (!currentUser) return;
+  const handleUploadFile = async (file: File, scope: string, patientId?: string, docType?: string) => {
+    if (!currentUser || !token) return;
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("scope", scope);
-    if (patientId) {
-      formData.append("patient_id", patientId);
-    }
+    if (patientId) formData.append("patient_id", patientId);
+    if (docType) formData.append("document_type", docType);
 
     const res = await fetch(`${API_BASE}/api/upload`, {
       method: "POST",
-      headers: {
-        "X-API-Key": API_KEY,
-        "X-User-Id": currentUser.username
-      },
+      headers: authHeaders,
       body: formData
     });
 
     if (res.ok) {
+      const data = await res.json();
       fetchData();
+      return data;
     } else {
       const err = await res.json();
-      alert(err.detail || "Error uploading document.");
+      throw new Error(err.detail || "Error uploading document.");
     }
   };
 
-  // Send RAG Query
   const handleSendMessage = async (text: string, filters: any, directLlm: boolean) => {
-    if (!currentUser) return;
+    if (!currentUser || !token) return;
 
     let targetSessionId = activeSessionId;
     if (!targetSessionId) {
@@ -262,8 +197,7 @@ export const App: React.FC = () => {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-API-Key": API_KEY,
-            "X-User-Id": currentUser.username
+            ...authHeaders
           },
           body: JSON.stringify({ title: text.slice(0, 30) })
         });
@@ -292,8 +226,7 @@ export const App: React.FC = () => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": API_KEY,
-          "X-User-Id": currentUser.username
+          ...authHeaders
         },
         body: JSON.stringify({
           session_id: targetSessionId,
@@ -319,30 +252,33 @@ export const App: React.FC = () => {
     }
   };
 
-  // Quick Action Shortcuts from Dashboard
   const handleQuickAsk = (question: string) => {
     setQuickQuestion(question);
     setActiveScreen("clinical_ai");
   };
 
   const handleSelectPatientForDashboard = (patientId: string) => {
-    setSelectedPatientId(patientId);
+    setReportPatientId(patientId);
     setActiveScreen("patients");
   };
 
   const handleAskAboutDoc = (doc: Document) => {
-    setQuickQuestion(`Summarize the key clinical findings in ${doc.name}`);
+    setQuickQuestion(`Summarize the clinical guidelines and recommendations in ${doc.name}`);
     setActiveScreen("clinical_ai");
     handleCreateSession();
   };
 
-  if (!currentUser) {
+  const handleLaunchReport = (patientId: string) => {
+    setReportPatientId(patientId);
+    setActiveScreen("reports");
+  };
+
+  if (!currentUser || !token) {
     return <Login onLoginSuccess={handleLoginSuccess} apiBase={API_BASE} />;
   }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-50 font-sans antialiased">
-      {/* Left Sidebar */}
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
@@ -357,7 +293,6 @@ export const App: React.FC = () => {
         onLogout={handleLogout}
       />
 
-      {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-full overflow-hidden">
         {activeScreen === "dashboard" && (
           <DashboardHome
@@ -365,7 +300,7 @@ export const App: React.FC = () => {
             patients={patients}
             documents={documents}
             sessions={sessions}
-            onNavigate={setActiveScreen}
+            onNavigate={(screen) => setActiveScreen(screen)}
             onSelectPatient={handleSelectPatientForDashboard}
             onSelectSession={setActiveSessionId}
             onQuickAsk={handleQuickAsk}
@@ -392,16 +327,37 @@ export const App: React.FC = () => {
         {activeScreen === "patients" && (
           <PatientDashboard
             patients={patients}
-            currentUser={currentUser}
-            apiBase={API_BASE}
-            apiKey={API_KEY}
-            selectedPatientId={selectedPatientId}
-            onSelectPatient={setSelectedPatientId}
-            onSelectDocumentForChat={handleAskAboutDoc}
-            onSelectPatientForChat={(pId) => {
-              setSelectedPatientId(pId);
+            onSelectPatient={(id) => setReportPatientId(id)}
+            onLaunchConsultation={(_id, q) => {
+              if (q) setQuickQuestion(q);
               setActiveScreen("clinical_ai");
             }}
+            onLaunchReport={handleLaunchReport}
+            apiBase={API_BASE}
+            token={token}
+            currentUser={currentUser}
+            onRefreshPatients={fetchData}
+          />
+        )}
+
+        {activeScreen === "reports" && (
+          <ReportStudio
+            patients={patients}
+            apiBase={API_BASE}
+            token={token}
+            currentUser={currentUser}
+            initialPatientId={reportPatientId}
+          />
+        )}
+
+        {activeScreen === "knowledge_base" && (
+          <KnowledgeBaseView
+            documents={documents}
+            apiBase={API_BASE}
+            token={token}
+            currentUser={currentUser}
+            onRefreshDocuments={fetchData}
+            onUploadFile={handleUploadFile}
           />
         )}
 
@@ -415,56 +371,18 @@ export const App: React.FC = () => {
           />
         )}
 
-        {activeScreen === "knowledge_base" && (
-          <KnowledgeBaseView
-            documents={documents}
-            onConsultGuideline={(docName) => {
-              setQuickQuestion(`What are the key clinical recommendations in ${docName}?`);
-              setActiveScreen("clinical_ai");
-            }}
+        {activeScreen === "users" && currentUser.role === "ADMIN" && (
+          <UserManagement
+            apiBase={API_BASE}
+            token={token}
           />
         )}
 
-        {activeScreen === "settings" && (
-          <div className="flex-1 h-full overflow-y-auto bg-slate-50 p-8 space-y-6">
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs max-w-2xl space-y-6">
-              <div className="flex items-center space-x-2 text-slate-800">
-                <Settings className="w-5 h-5 text-blue-600" />
-                <h1 className="text-xl font-bold">System & RAG Configuration</h1>
-              </div>
-
-              <div className="space-y-4 text-xs">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">RAG Endpoint</label>
-                  <input
-                    type="text"
-                    disabled
-                    value={API_BASE}
-                    className="w-full bg-slate-100 border border-slate-300 rounded-xl p-2.5 font-mono text-slate-600"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">API Key Authentication</label>
-                  <input
-                    type="password"
-                    disabled
-                    value={API_KEY}
-                    className="w-full bg-slate-100 border border-slate-300 rounded-xl p-2.5 font-mono text-slate-600"
-                  />
-                </div>
-
-                <div className="pt-4 border-t border-slate-200 space-y-2">
-                  <div className="font-bold text-slate-800">Grounding & Reranker Settings</div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl text-blue-800 space-y-1">
-                    <div>• Retrieval: <strong>BM25 + FAISS Hybrid</strong> (Reciprocal Rank Fusion k=60)</div>
-                    <div>• Reranker: <strong>Cross-Encoder</strong> (ms-marco-MiniLM-L-6-v2)</div>
-                    <div>• Cosine Fact-Verification Threshold: <strong>0.70</strong></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+        {activeScreen === "audit_logs" && currentUser.role === "ADMIN" && (
+          <AuditLogView
+            apiBase={API_BASE}
+            token={token}
+          />
         )}
       </main>
     </div>

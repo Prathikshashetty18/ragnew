@@ -3,28 +3,12 @@ import {
   FileText, Upload, CheckCircle2, Loader2, Sparkles, 
   Search, Filter, Database
 } from "lucide-react";
-
-interface Document {
-  id: number;
-  name: string;
-  status: string;
-  chunk_count: number;
-  scope: string;
-  patient_id?: string | null;
-  uploaded_by?: string;
-  uploader_role?: string;
-  created_at: string;
-}
-
-interface Patient {
-  id: string;
-  name: string;
-}
+import type { Document, Patient } from "../types";
 
 interface DocumentLibraryProps {
   documents: Document[];
   patients: Patient[];
-  onUploadFile: (file: File, scope: string, patientId?: string) => Promise<void>;
+  onUploadFile: (file: File, scope: string, patientId?: string) => Promise<any>;
   onAskAboutDoc: (doc: Document) => void;
   isLoading?: boolean;
 }
@@ -58,8 +42,8 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
         await onUploadFile(file, uploadScope, uploadPatientId || undefined);
         setUploadSuccessMsg(`Successfully uploaded and indexed "${file.name}"!`);
         setTimeout(() => setUploadSuccessMsg(null), 4000);
-      } catch (err) {
-        console.error(err);
+      } catch (err: any) {
+        alert(err.message || "Upload failed.");
       } finally {
         setIsUploading(false);
         if (fileInputRef.current) fileInputRef.current.value = "";
@@ -75,7 +59,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
 
   return (
     <div className="flex-1 h-full overflow-y-auto bg-slate-50 text-slate-800 p-6 md:p-8 space-y-6">
-      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
         <div>
           <div className="flex items-center space-x-2 text-blue-600 text-xs font-bold uppercase tracking-wider mb-1">
@@ -90,7 +73,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
           </p>
         </div>
 
-        {/* Upload Button */}
         <div className="flex items-center space-x-3">
           <input
             type="file"
@@ -119,7 +101,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
         </div>
       </div>
 
-      {/* Upload Scope Configuration Banner */}
       <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-3">
         <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
           Upload Destination & Scope
@@ -173,7 +154,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
         )}
       </div>
 
-      {/* Filter and Search Bar */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
         <div className="relative flex-1 max-w-md">
           <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
@@ -211,7 +191,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
         </div>
       </div>
 
-      {/* Document Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">

@@ -21,8 +21,11 @@ from app.config import (
     EMBEDDING_MODEL_NAME,
     RERANK_MODEL_NAME,
     SIMILARITY_THRESHOLD_SUPPORTED,
-    SIMILARITY_THRESHOLD_PARTIAL
+    SIMILARITY_THRESHOLD_PARTIAL,
+    NLI_ENTAILMENT_THRESHOLD,
+    NLI_CONTRADICTION_THRESHOLD
 )
+from app.nli_validator import validate_response_with_nli, filter_citations_by_permission
 
 # Global variables to store models and indices in memory
 _models_lock = threading.Lock()
@@ -64,9 +67,7 @@ def get_vector_store():
                     with open(metadata_path, "rb") as f:
                         _chunks_metadata = pickle.load(f)
                     
-                    # Reconstruct embeddings array in memory
                     if _faiss_index.ntotal > 0:
-                        print(f"Reconstructing {_faiss_index.ntotal} embeddings from FAISS...")
                         try:
                             _embeddings_array = _faiss_index.reconstruct_n(0, _faiss_index.ntotal)
                         except AttributeError:
@@ -80,8 +81,6 @@ def get_vector_store():
                     _embeddings_array = None
             
             if _faiss_index is None:
-                # Initialize new L2 or Inner Product index. We'll use Inner Product with normalized vectors (cosine similarity).
-                # all-MiniLM-L6-v2 dimension is 384
                 dimension = 384
                 _faiss_index = faiss.IndexFlatIP(dimension)
                 _chunks_metadata = []
@@ -99,16 +98,41 @@ def save_vector_store(index, metadata):
             pickle.dump(metadata, f)
         print("Saved FAISS index and metadata to disk.")
 
-# Simple utility to split text into sentences
+def remove_document_from_vector_store(doc_id: int):
+    """Removes all chunks belonging to a document from the FAISS vector store and rebuilds the index."""
+    global _faiss_index, _chunks_metadata, _embeddings_array
+    with _vector_store_lock:
+        _, metadata, _ = get_vector_store()
+        
+        retained_chunks = [c for c in metadata if c.get("document_id") != doc_id]
+        if len(retained_chunks) == len(metadata):
+            return  # No chunks removed
+            
+        print(f"Removing document ID {doc_id} from vector store. Rebuilding FAISS index with {len(retained_chunks)} chunks...")
+        dimension = 384
+        new_index = faiss.IndexFlatIP(dimension)
+        
+        if retained_chunks:
+            embedder = get_embedding_model()
+            texts = [c["text"] for c in retained_chunks]
+            embeddings = embedder.encode(texts)
+            embeddings = np.array(embeddings).astype("float32")
+            faiss.normalize_L2(embeddings)
+            new_index.add(embeddings)
+            _embeddings_array = embeddings
+        else:
+            _embeddings_array = None
+            
+        _faiss_index = new_index
+        _chunks_metadata = retained_chunks
+        save_vector_store(_faiss_index, _chunks_metadata)
+
 def split_into_sentences(text):
-    # Regex splits by . ! ? followed by space and capital letter or end of string
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     return [s.strip() for s in sentences if len(s.strip()) > 5]
 
-# Simple Character-based Text Splitter with Overlap
-def chunk_text(text, pdf_name, page_number, chunk_size=500, chunk_overlap=100, doc_id=None, scope="knowledge_base", patient_id=None):
+def chunk_text(text, pdf_name, page_number, chunk_size=500, chunk_overlap=100, doc_id=None, scope="knowledge_base", patient_id=None, version="1.0", document_type="Guideline"):
     chunks = []
-    # Let's clean up whitespace
     clean_text = re.sub(r'\s+', ' ', text).strip()
     
     start = 0
@@ -116,7 +140,6 @@ def chunk_text(text, pdf_name, page_number, chunk_size=500, chunk_overlap=100, d
         end = start + chunk_size
         chunk_content = clean_text[start:end]
         
-        # Try to break at a space boundary if possible
         if end < len(clean_text):
             last_space = chunk_content.rfind(' ')
             if last_space != -1 and last_space > (chunk_size // 2):
@@ -130,7 +153,10 @@ def chunk_text(text, pdf_name, page_number, chunk_size=500, chunk_overlap=100, d
             "page_number": page_number,
             "document_id": doc_id,
             "scope": scope,
-            "patient_id": patient_id
+            "patient_id": patient_id,
+            "version": version,
+            "document_type": document_type,
+            "status": "ACTIVE"
         })
         
         start += (chunk_size - chunk_overlap)
@@ -139,19 +165,26 @@ def chunk_text(text, pdf_name, page_number, chunk_size=500, chunk_overlap=100, d
             
     return chunks
 
-def process_pdf(file_path: str, filename: str, doc_id: int = None, scope: str = "knowledge_base", patient_id: str = None) -> int:
+def process_pdf(file_path: str, filename: str, doc_id: int = None, scope: str = "knowledge_base", patient_id: str = None, version: str = "1.0", document_type: str = "Guideline") -> int:
     """Extracts text page-by-page, chunks it, embeds it, and stores in FAISS with metadata."""
-    print(f"Processing PDF: {filename} from {file_path} (scope={scope}, patient={patient_id})")
+    print(f"Processing PDF: {filename} from {file_path} (scope={scope}, patient={patient_id}, version={version})")
     reader = PdfReader(file_path)
     all_chunks = []
     
-    # 1. Ingest page by page
     for page_idx, page in enumerate(reader.pages):
         page_num = page_idx + 1
         page_text = page.extract_text() or ""
         if page_text.strip():
-            # 2. Chunk text with metadata
-            page_chunks = chunk_text(page_text, filename, page_num, doc_id=doc_id, scope=scope, patient_id=patient_id)
+            page_chunks = chunk_text(
+                page_text,
+                filename,
+                page_num,
+                doc_id=doc_id,
+                scope=scope,
+                patient_id=patient_id,
+                version=version,
+                document_type=document_type
+            )
             all_chunks.extend(page_chunks)
             
     if not all_chunks:
@@ -160,21 +193,17 @@ def process_pdf(file_path: str, filename: str, doc_id: int = None, scope: str = 
         
     print(f"Extracted {len(all_chunks)} chunks from {filename}.")
     
-    # 3. Generate embeddings
     embedder = get_embedding_model()
     texts = [chunk["text"] for chunk in all_chunks]
     
-    # Encode and normalize embeddings (for cosine similarity using Inner Product)
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts, show_progress_bar=False)
     embeddings = np.array(embeddings).astype("float32")
     faiss.normalize_L2(embeddings)
     
-    # 4. Store in FAISS
     index, metadata, embed_arr = get_vector_store()
     index.add(embeddings)
     metadata.extend(all_chunks)
     
-    # Update embeddings array in memory
     global _embeddings_array
     if _embeddings_array is None:
         _embeddings_array = embeddings
@@ -185,13 +214,12 @@ def process_pdf(file_path: str, filename: str, doc_id: int = None, scope: str = 
     return len(all_chunks)
 
 def call_groq_llm(prompt: str) -> str:
-    """Helper to query Llama 3.3 model using Groq API."""
     try:
         client = Groq(api_key=GROQ_API_KEY)
         completion = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "You are a clinical decision support system. Answer the medical question using the provided context. Be precise, professional, and base your answers strictly on the context provided."},
+                {"role": "system", "content": "You are a hospital clinical decision support system. Answer the medical question using the provided context. Be precise, professional, and base your answers strictly on the context provided."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
@@ -203,7 +231,6 @@ def call_groq_llm(prompt: str) -> str:
         raise e
 
 def call_gemini_fallback(prompt: str) -> str:
-    """Call Gemini API via http.client if Groq is not available but GEMINI/GOOGLE API key is."""
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise ValueError("No Gemini/Google API Key found.")
@@ -235,13 +262,10 @@ def call_gemini_fallback(prompt: str) -> str:
         raise e
 
 def generate_mock_answer(query: str, retrieved_chunks: list) -> str:
-    """Creates a mock RAG answer strictly from sentences in retrieved chunks if no LLM key is configured."""
-    print("No API Key detected. Using mock RAG response generator.")
     sentences = []
     for chunk in retrieved_chunks:
         sentences.extend(split_into_sentences(chunk["text"]))
         
-    # Match key query words
     query_words = set(re.findall(r'\w+', query.lower()))
     matched_sentences = []
     for s in sentences:
@@ -254,13 +278,12 @@ def generate_mock_answer(query: str, retrieved_chunks: list) -> str:
     
     if matched_sentences:
         answer_parts = [item[1] for item in matched_sentences[:3]]
-        answer = " Based on the uploaded medical documents: " + " ".join(answer_parts)
+        answer = "Based on the verified clinical reference documents: " + " ".join(answer_parts)
     else:
-        answer = "No matching references found in context. General recommendation: please verify with clinical guidelines."
+        answer = "No matching reference was found in the authorized clinical documents. Please consult hospital protocols."
         
     return answer
 
-# Lightweight Python BM25 implementation
 class BM25Retriever:
     def __init__(self, corpus_chunks, k1=1.5, b=0.75):
         self.k1 = k1
@@ -282,7 +305,6 @@ class BM25Retriever:
                 nd[word] = nd.get(word, 0) + 1
         
         for word, freq in nd.items():
-            # Standard BM25 IDF formula
             self.idf[word] = math.log((self.N - freq + 0.5) / (freq + 0.5) + 1.0)
 
     def get_scores(self, query_terms):
@@ -300,13 +322,13 @@ class BM25Retriever:
             scores.append(score)
         return scores
 
-def query_pipeline(query: str, filters: dict = None, direct_llm: bool = False) -> dict:
-    """Executes search (with filters, FAISS+BM25, RRF hybrid), reranking, generation, verification, and confidence assessment."""
+def query_pipeline(query: str, filters: dict = None, direct_llm: bool = False, user_role: str = "DOCTOR", active_doc_ids: set = None) -> dict:
+    """Executes search (FAISS Top 20 + BM25, RRF hybrid), Cross-Encoder reranking (Top 5), Llama 3.3 70B generation, NLI validation, and permission-aware citations."""
     index, metadata, embeddings_array = get_vector_store()
     
     if len(metadata) == 0 and not direct_llm:
         return {
-            "answer": "No clinical documents have been uploaded to the system yet. Please upload a medical guideline PDF to enable Retrieval-Augmented Generation.",
+            "answer": "No active clinical documents have been indexed in the system yet. Please upload hospital guidelines to enable Retrieval-Augmented Generation.",
             "confidence_level": "Low",
             "confidence_score": 0.0,
             "evidence": [],
@@ -315,9 +337,8 @@ def query_pipeline(query: str, filters: dict = None, direct_llm: bool = False) -
         
     # DIRECT LLM Mode
     if direct_llm:
-        prompt = f"""You are a clinical decision support system. The user is asking a medical question.
-Please answer it directly using your general medical knowledge.
-IMPORTANT: Clearly label your answer as a direct LLM response without retrieved document evidence.
+        prompt = f"""You are a clinical decision support assistant. Answer the medical question directly using general clinical knowledge.
+IMPORTANT: Clearly label your answer as a direct unverified LLM response.
 
 USER QUESTION:
 {query}
@@ -327,7 +348,6 @@ CLINICAL RESPONSE (DIRECT LLM):"""
         answer = ""
         using_mock = False
         
-        # Try LLM APIs
         if GROQ_API_KEY:
             try:
                 answer = call_groq_llm(prompt)
@@ -363,10 +383,14 @@ CLINICAL RESPONSE (DIRECT LLM):"""
             "using_mock": using_mock
         }
 
-    # STRICT RAG Mode with Scoped Filtering
-    # 1. Filter chunks by scope
+    # STRICT RAG Mode with Scoped & Active Document Filtering
     filtered_chunks_with_indices = []
     for idx, chunk in enumerate(metadata):
+        # Lifecycle check: Ensure document is active if active_doc_ids filter is provided
+        doc_id = chunk.get("document_id")
+        if active_doc_ids is not None and doc_id is not None and doc_id not in active_doc_ids:
+            continue
+            
         match = True
         if filters:
             scope = filters.get("scope")
@@ -378,9 +402,8 @@ CLINICAL RESPONSE (DIRECT LLM):"""
                 if chunk.get("scope") != "patient" or chunk.get("patient_id") != patient_id:
                     match = False
             elif scope == "temporary":
-                doc_id = filters.get("document_id")
-                # Handle both int and string comparisons
-                if str(chunk.get("document_id")) != str(doc_id):
+                doc_id_filter = filters.get("document_id")
+                if str(chunk.get("document_id")) != str(doc_id_filter):
                     match = False
             elif scope == "patient_and_kb":
                 patient_id = filters.get("patient_id")
@@ -394,14 +417,14 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     if not filtered_chunks_with_indices:
         scope_desc = filters.get("scope", "requested") if filters else "requested"
         return {
-            "answer": f"No relevant context could be retrieved for the {scope_desc} scope. Please upload relevant guidelines or reports.",
+            "answer": f"No active documents could be retrieved for the {scope_desc} scope. Please check document approval status.",
             "confidence_level": "Low",
             "confidence_score": 0.0,
             "evidence": [],
             "verification_results": []
         }
 
-    # 2. Get Semantic Similarity Scores (FAISS)
+    # 2. FAISS Top 20 Candidates
     embedder = get_embedding_model()
     query_vector = embedder.encode([query])
     query_vector = np.array(query_vector).astype("float32")
@@ -409,7 +432,6 @@ CLINICAL RESPONSE (DIRECT LLM):"""
 
     filtered_indices = [idx for idx, _ in filtered_chunks_with_indices]
     
-    # Load / Reconstruct embeddings array if needed
     if embeddings_array is None:
         try:
             embeddings_array = index.reconstruct_n(0, index.ntotal)
@@ -422,14 +444,13 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     else:
         semantic_scores = np.zeros(len(filtered_indices))
 
-    # 3. Get Keyword Scores (BM25)
+    # 3. BM25 Keyword Search
     query_terms = re.findall(r'\w+', query.lower())
     filtered_chunks = [item[1] for item in filtered_chunks_with_indices]
     bm25 = BM25Retriever(filtered_chunks)
     bm25_scores = bm25.get_scores(query_terms)
 
-    # 4. Hybrid Scoring using Reciprocal Rank Fusion (RRF)
-    # Sort semantic and BM25 scores descending to get ranks
+    # 4. RRF Fusion (Top 20 candidate pool)
     semantic_rank_indices = np.argsort(semantic_scores)[::-1]
     bm25_rank_indices = np.argsort(bm25_scores)[::-1]
 
@@ -440,45 +461,43 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     for idx in range(len(filtered_chunks)):
         bm25_rank = bm25_ranks[idx] if bm25_scores[idx] > 0 else 1e9
         sem_rank = semantic_ranks[idx]
-        
-        # RRF formula (k=60)
         rrf_score = 1.0 / (60 + sem_rank) + 1.0 / (60 + bm25_rank)
         rrf_scores.append(rrf_score)
 
-    # Sort chunks by hybrid RRF score
     sorted_indices = np.argsort(rrf_scores)[::-1]
-    top_k_indices = sorted_indices[:5]
+    top_candidates_indices = sorted_indices[:min(20, len(sorted_indices))]
     
-    top_chunks = []
-    for idx in top_k_indices:
+    candidate_chunks = []
+    for idx in top_candidates_indices:
         chunk = filtered_chunks[idx].copy()
         chunk["retrieval_score"] = float(semantic_scores[idx])
         chunk["bm25_score"] = float(bm25_scores[idx])
-        top_chunks.append(chunk)
+        candidate_chunks.append(chunk)
 
-    # 5. Rerank using Cross-Encoder
+    # 5. Cross-Encoder Reranking -> Select Top 5
     cross_encoder = get_cross_encoder_model()
-    pairs = [[query, c["text"]] for c in top_chunks]
+    pairs = [[query, c["text"]] for c in candidate_chunks]
     rerank_scores = cross_encoder.predict(pairs)
     
-    # Sort by rerank score descending
     for i, score in enumerate(rerank_scores):
-        top_chunks[i]["rerank_score"] = float(score)
+        candidate_chunks[i]["rerank_score"] = float(score)
         
-    top_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+    candidate_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+    top_chunks = candidate_chunks[:5]
     
-    # 6. Context construction & Answer Generation
+    # 6. Context synthesis & Llama 3.3 70B generation
     context_passages = []
     for c in top_chunks:
-        scope_label = "PATIENT DOCUMENT" if c.get("scope") == "patient" else "HOSPITAL KNOWLEDGE BASE"
-        passage = f"Scope: {scope_label}\nSource: {c['pdf_name']} (Page {c['page_number']})\nContent: {c['text']}"
+        scope_label = "PATIENT RECORD" if c.get("scope") == "patient" else "HOSPITAL GUIDELINE"
+        version_str = f" (Edition/Version: {c.get('version', '1.0')})" if c.get("version") else ""
+        passage = f"[{scope_label}] Source: {c['pdf_name']}{version_str}, Page {c['page_number']}\nContent: {c['text']}"
         context_passages.append(passage)
         
     context_text = "\n\n".join(context_passages)
     
     prompt = f"""Use the following medical context passages to answer the user's clinical query.
 Your answer must be accurate, clinical, and directly supported by the context.
-Do not introduce outside knowledge or exaggerate findings. If the context does not contain the answer, say so.
+Do not introduce outside knowledge or exaggerate findings. If the context does not contain the answer, state that clearly.
 
 ---
 CONTEXT:
@@ -518,109 +537,35 @@ CLINICAL RESPONSE:"""
             answer = generate_mock_answer(query, top_chunks)
             using_mock = True
 
-    # 7. Sentence-Level Answer Verification
-    response_sentences = split_into_sentences(answer)
+    # 7. NLI Fact-Verification Engine
+    nli_results = validate_response_with_nli(
+        answer=answer,
+        context_chunks=top_chunks,
+        embedder=embedder,
+        cross_encoder=cross_encoder,
+        similarity_threshold_entailment=SIMILARITY_THRESHOLD_SUPPORTED,
+        similarity_threshold_partial=SIMILARITY_THRESHOLD_PARTIAL
+    )
     
-    context_sentences_metadata = []
-    for chunk in top_chunks:
-        c_sents = split_into_sentences(chunk["text"])
-        for s in c_sents:
-            context_sentences_metadata.append({
-                "text": s,
-                "pdf_name": chunk["pdf_name"],
-                "page_number": chunk["page_number"]
-            })
-            
-    verification_results = []
-    evidence = []
-    unsupported_count = 0
-    total_score_sum = 0.0
+    # 8. Role-Based Citation Filtering
+    permitted_evidence = filter_citations_by_permission(nli_results["evidence"], user_role)
     
-    if response_sentences and context_sentences_metadata:
-        resp_embeddings = embedder.encode(response_sentences)
-        ctx_embeddings = embedder.encode([item["text"] for item in context_sentences_metadata])
-        
-        # Normalize
-        resp_embeddings = resp_embeddings / np.linalg.norm(resp_embeddings, axis=1, keepdims=True)
-        ctx_embeddings = ctx_embeddings / np.linalg.norm(ctx_embeddings, axis=1, keepdims=True)
-        
-        similarity_matrix = np.dot(resp_embeddings, ctx_embeddings.T)
-        
-        for r_idx, r_sent in enumerate(response_sentences):
-            best_ctx_idx = int(np.argmax(similarity_matrix[r_idx]))
-            max_sim = float(similarity_matrix[r_idx][best_ctx_idx])
-            best_ctx = context_sentences_metadata[best_ctx_idx]
+    # Fallback if Low confidence or contradictions detected
+    final_answer = answer
+    if nli_results["confidence_level"] == "Low" and not using_mock:
+        if nli_results.get("contradiction_count", 0) > 0:
+            final_answer = "The retrieved evidence contained conflicting or contradictory findings regarding this question. Please review the official hospital guideline documents directly."
+        else:
+            final_answer = "I do not have sufficient evidence in the retrieved documents to answer this question reliably. (Clinical safety safeguard: ungrounded claims are suppressed.)"
             
-            if max_sim >= SIMILARITY_THRESHOLD_SUPPORTED:
-                status = "Supported"
-            elif max_sim >= SIMILARITY_THRESHOLD_PARTIAL:
-                status = "Partially Supported"
-            else:
-                status = "Unsupported"
-                unsupported_count += 1
-                
-            total_score_sum += max_sim
-            
-            verification_entry = {
-                "sentence": r_sent,
-                "status": status,
-                "score": max_sim,
-                "source_sentence": best_ctx["text"],
-                "pdf_name": best_ctx["pdf_name"],
-                "page_number": best_ctx["page_number"]
-            }
-            verification_results.append(verification_entry)
-            
-            if status != "Unsupported":
-                evidence_entry = {
-                    "pdf_name": best_ctx["pdf_name"],
-                    "page_number": best_ctx["page_number"],
-                    "supporting_text": best_ctx["text"],
-                    "response_sentence": r_sent
-                }
-                if not any(e["supporting_text"] == best_ctx["text"] for e in evidence):
-                    evidence.append(evidence_entry)
-    else:
-        for s in response_sentences:
-            verification_results.append({
-                "sentence": s,
-                "status": "Unsupported",
-                "score": 0.0,
-                "source_sentence": "",
-                "pdf_name": "N/A",
-                "page_number": 0
-            })
-        unsupported_count = len(response_sentences)
-        
-    # 8. Confidence Score & Level calculation
-    if len(response_sentences) > 0:
-        avg_verification_score = total_score_sum / len(response_sentences)
-    else:
-        avg_verification_score = 0.0
-        
-    avg_retrieval_score = sum(c.get("retrieval_score", 0.0) for c in top_chunks) / len(top_chunks) if top_chunks else 0.0
-    confidence_score = (avg_verification_score * 0.7) + (avg_retrieval_score * 0.3)
-    
-    if unsupported_count > 0 or len(metadata) == 0:
-        confidence_level = "Low"
-    elif confidence_score >= 0.75:
-        confidence_level = "High"
-    elif confidence_score >= 0.55:
-        confidence_level = "Medium"
-    else:
-        confidence_level = "Low"
-
-    # STRICT RAG Fallback: If low confidence or has unsupported statements, show 'I don't know' fallback
-    if confidence_level == "Low" and not using_mock:
-        answer = "I do not have sufficient evidence in the retrieved documents to answer this question. (Note: RAG grounds responses in retrieved evidence and reduces unsupported generation. The retrieved sources did not contain enough direct support to verify this answer safely.)"
-        verification_results = []
-        evidence = []
-        
     return {
-        "answer": answer,
-        "confidence_level": confidence_level,
-        "confidence_score": float(round(confidence_score, 2)),
-        "evidence": evidence,
-        "verification_results": verification_results,
-        "using_mock": using_mock
+        "answer": final_answer,
+        "confidence_level": nli_results["confidence_level"],
+        "confidence_score": nli_results["confidence_score"],
+        "evidence": permitted_evidence,
+        "verification_results": nli_results["verification_results"],
+        "using_mock": using_mock,
+        "entailment_count": nli_results.get("entailment_count", 0),
+        "neutral_count": nli_results.get("neutral_count", 0),
+        "contradiction_count": nli_results.get("contradiction_count", 0)
     }

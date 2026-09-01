@@ -2,14 +2,9 @@ import React from "react";
 import { 
   Plus, MessageSquare, Trash2, FileText, PanelLeftClose, 
   LayoutDashboard, Users, BrainCircuit, LogOut,
-  Shield, BookOpen, Clock, Settings
+  Shield, BookOpen, Clock, FileCheck2, UserCog, ShieldAlert
 } from "lucide-react";
-
-interface Session {
-  id: string;
-  title: string;
-  created_at: string;
-}
+import type { Session, UserProfile } from "../types";
 
 interface SidebarProps {
   sessions: Session[];
@@ -19,9 +14,9 @@ interface SidebarProps {
   onDeleteSession: (id: string, e: React.MouseEvent) => void;
   isOpen: boolean;
   onToggleOpen: () => void;
-  activeScreen: "dashboard" | "clinical_ai" | "patients" | "documents" | "knowledge_base" | "settings";
-  onNavigate: (screen: "dashboard" | "clinical_ai" | "patients" | "documents" | "knowledge_base" | "settings") => void;
-  currentUser: { id: number; username: string; role: string; name: string };
+  activeScreen: string;
+  onNavigate: (screen: string) => void;
+  currentUser: UserProfile;
   onLogout: () => void;
 }
 
@@ -38,13 +33,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   currentUser,
   onLogout
 }) => {
+  const isAdmin = currentUser.role === "ADMIN";
+
   return (
     <aside
       className={`relative z-20 flex flex-col h-full bg-slate-900 border-r border-slate-800 text-slate-300 transition-all duration-300 ease-in-out shrink-0 select-none ${
         isOpen ? "w-64" : "w-0 overflow-hidden"
       }`}
     >
-      {/* Brand Header */}
       <div className="p-4 border-b border-slate-800 flex items-center justify-between">
         <div 
           onClick={() => onNavigate("dashboard")}
@@ -55,10 +51,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
           <div>
             <div className="font-bold text-xs leading-tight text-white group-hover:text-blue-300 transition-colors">
-              RAG Based CDSS
+              Clinical RAG CDSS
             </div>
             <div className="text-[10px] text-slate-400 font-medium">
-              Clinical Decision System
+              Hospital Decision Support
             </div>
           </div>
         </div>
@@ -71,7 +67,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
       </div>
 
-      {/* New Consultation Action Button */}
       <div className="p-3">
         <button
           onClick={() => {
@@ -85,8 +80,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
       </div>
 
-      {/* Navigation Links */}
-      <div className="px-3 py-2 space-y-1">
+      <div className="px-3 py-1.5 space-y-1">
         <button
           onClick={() => onNavigate("dashboard")}
           className={`w-full flex items-center space-x-3 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
@@ -120,19 +114,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
           }`}
         >
           <Users className="w-4 h-4 shrink-0" />
-          <span>Patient Charts</span>
+          <span>Patients</span>
         </button>
 
         <button
-          onClick={() => onNavigate("documents")}
+          onClick={() => onNavigate("reports")}
           className={`w-full flex items-center space-x-3 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-            activeScreen === "documents"
+            activeScreen === "reports"
               ? "bg-blue-600/15 text-blue-400 border border-blue-500/30"
               : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-200"
           }`}
         >
-          <FileText className="w-4 h-4 shrink-0" />
-          <span>Document Library</span>
+          <FileCheck2 className="w-4 h-4 shrink-0" />
+          <span>Report Studio</span>
         </button>
 
         <button
@@ -148,19 +142,46 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
 
         <button
-          onClick={() => onNavigate("settings")}
+          onClick={() => onNavigate("documents")}
           className={`w-full flex items-center space-x-3 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-            activeScreen === "settings"
+            activeScreen === "documents"
               ? "bg-blue-600/15 text-blue-400 border border-blue-500/30"
               : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-200"
           }`}
         >
-          <Settings className="w-4 h-4 shrink-0" />
-          <span>System Settings</span>
+          <FileText className="w-4 h-4 shrink-0" />
+          <span>Documents</span>
         </button>
+
+        {isAdmin && (
+          <>
+            <button
+              onClick={() => onNavigate("users")}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                activeScreen === "users"
+                  ? "bg-red-500/20 text-red-400 border border-red-500/40"
+                  : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-200"
+              }`}
+            >
+              <UserCog className="w-4 h-4 shrink-0 text-red-400" />
+              <span>User Management</span>
+            </button>
+
+            <button
+              onClick={() => onNavigate("audit_logs")}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                activeScreen === "audit_logs"
+                  ? "bg-purple-500/20 text-purple-400 border border-purple-500/40"
+                  : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-200"
+              }`}
+            >
+              <ShieldAlert className="w-4 h-4 shrink-0 text-purple-400" />
+              <span>Audit Logs</span>
+            </button>
+          </>
+        )}
       </div>
 
-      {/* Consultation History */}
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         <div className="flex items-center justify-between px-2 pt-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">
           <span>Consultation History</span>
@@ -202,7 +223,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
       </div>
 
-      {/* Bottom User Profile Card & Logout */}
       <div className="p-3 border-t border-slate-800 bg-slate-950/40">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2.5 truncate">

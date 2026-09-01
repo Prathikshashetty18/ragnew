@@ -1,40 +1,17 @@
 import React, { useState } from "react";
 import { 
   Sparkles, ArrowRight, Upload, Users, BookOpen, Activity, 
-  FileText, ShieldCheck, CheckCircle, Clock, Stethoscope, ChevronRight,
-  TrendingUp, Database, FlaskConical
+  CheckCircle, Clock, Stethoscope, ChevronRight,
+  TrendingUp, Database, FlaskConical, ShieldCheck
 } from "lucide-react";
-
-interface Patient {
-  id: string;
-  name: string;
-  age: number;
-  gender: string;
-  health_status: string;
-  assigned_doctor: string;
-}
-
-interface Document {
-  id: number;
-  name: string;
-  status: string;
-  chunk_count: number;
-  scope: string;
-  created_at: string;
-}
-
-interface Session {
-  id: string;
-  title: string;
-  created_at: string;
-}
+import type { Patient, Document, Session, UserProfile } from "../types";
 
 interface DashboardHomeProps {
-  currentUser: { id: number; username: string; role: string; name: string };
+  currentUser: UserProfile;
   patients: Patient[];
   documents: Document[];
   sessions: Session[];
-  onNavigate: (screen: "dashboard" | "clinical_ai" | "patients" | "documents" | "knowledge_base" | "settings") => void;
+  onNavigate: (screen: string) => void;
   onSelectPatient: (patientId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onQuickAsk: (question: string) => void;
@@ -63,15 +40,14 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
     "What is the empirical antibiotic therapy for outpatient pneumonia as per hospital guidelines?",
     "What are the diagnostic criteria and workup required for suspected pulmonary tuberculosis?",
     "What are the major acute complications of Type 2 Diabetes Mellitus?",
-    "Summarize vital signs and current clinical status for patient P001."
+    "Summarize vital signs and current clinical status for patient PAT-2026-000101."
   ];
 
-  const kbDocs = documents.filter(d => d.scope === "knowledge_base");
+  const kbDocs = documents.filter(d => d.scope === "knowledge_base" && d.approval_status === "ACTIVE");
   const totalChunks = documents.reduce((acc, curr) => acc + (curr.chunk_count || 0), 0);
 
   return (
     <div className="flex-1 h-full overflow-y-auto bg-slate-50 text-slate-800 p-6 md:p-8 space-y-8">
-      {/* Top Welcome Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
         <div className="space-y-1">
           <div className="flex items-center space-x-2">
@@ -79,7 +55,7 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
               {currentUser.role} Workspace
             </span>
             <span className="text-xs text-slate-400">•</span>
-            <span className="text-xs text-slate-500 font-medium">Department of Internal Medicine</span>
+            <span className="text-xs text-slate-500 font-medium">{currentUser.department || "Internal Medicine"}</span>
           </div>
           <h1 className="text-2xl md:text-3xl font-extrabold text-slate-900 tracking-tight">
             Welcome back, {currentUser.name}
@@ -89,7 +65,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
           </p>
         </div>
 
-        {/* Quick Top Actions */}
         <div className="flex items-center space-x-3">
           <button
             onClick={() => onNavigate("clinical_ai")}
@@ -108,7 +83,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
         </div>
       </div>
 
-      {/* Clinical AI Quick Ask Search Box */}
       <div className="bg-gradient-to-r from-blue-900 via-slate-900 to-blue-950 p-6 md:p-8 rounded-2xl text-white shadow-lg shadow-blue-950/20 border border-blue-800/40 relative overflow-hidden">
         <div className="absolute top-0 right-0 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
         
@@ -140,7 +114,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
             </button>
           </form>
 
-          {/* Prompt suggestions */}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             <span className="text-[11px] text-slate-300 font-medium">Quick Prompts:</span>
             {sampleQuickQuestions.map((q, idx) => (
@@ -157,7 +130,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
         </div>
       </div>
 
-      {/* Metrics Row */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
           <div className="space-y-1">
@@ -197,9 +169,9 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
           <div className="space-y-1">
             <span className="text-xs font-semibold text-slate-500">Grounding Confidence</span>
-            <div className="text-2xl font-black text-slate-900">94.2%</div>
+            <div className="text-2xl font-black text-slate-900">95.4%</div>
             <span className="text-[11px] text-emerald-600 font-medium flex items-center">
-              <TrendingUp className="w-3 h-3 mr-1" /> Sentence-level verified
+              <TrendingUp className="w-3 h-3 mr-1" /> NLI Verified
             </span>
           </div>
           <div className="w-12 h-12 bg-amber-50 rounded-xl flex items-center justify-center text-amber-600">
@@ -208,16 +180,13 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
         </div>
       </div>
 
-      {/* Main Grid: Patients and Recent Consultations */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left 2 Cols: Assigned Patients & Quick Actions */}
         <div className="lg:col-span-2 space-y-6">
-          {/* Assigned Patients Card */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-base font-bold text-slate-900">Assigned Patient Profiles</h3>
-                <p className="text-xs text-slate-500">Patients under active monitoring in your department</p>
+                <p className="text-xs text-slate-500">Patients under active monitoring</p>
               </div>
               <button
                 onClick={() => onNavigate("patients")}
@@ -240,11 +209,11 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
                       {patient.id}
                     </span>
                     <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                      patient.health_status === "Under Review" ? "bg-amber-100 text-amber-800" :
-                      patient.health_status === "Stable" ? "bg-emerald-100 text-emerald-800" :
-                      "bg-slate-200 text-slate-800"
+                      patient.status === "ACTIVE" ? "bg-emerald-100 text-emerald-800" :
+                      patient.status === "DISCHARGED" ? "bg-slate-200 text-slate-800" :
+                      "bg-amber-100 text-amber-800"
                     }`}>
-                      {patient.health_status}
+                      {patient.status}
                     </span>
                   </div>
 
@@ -253,14 +222,14 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
                       {patient.name}
                     </div>
                     <div className="text-xs text-slate-500 mt-0.5">
-                      {patient.age} yrs • {patient.gender === "M" ? "Male" : "Female"} • Assigned: {patient.assigned_doctor}
+                      {patient.age} yrs • {patient.gender} • Dept: {patient.department}
                     </div>
                   </div>
 
                   <div className="mt-3 pt-2.5 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
                     <span className="flex items-center space-x-1">
                       <Activity className="w-3.5 h-3.5 text-blue-500" />
-                      <span>Vitals Recorded</span>
+                      <span>Doctor: {patient.assigned_doctor || "Staff"}</span>
                     </span>
                     <span className="font-semibold text-blue-600 group-hover:underline">Open Chart &rarr;</span>
                   </div>
@@ -269,7 +238,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
             </div>
           </div>
 
-          {/* Quick Department Actions */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
             <h3 className="text-base font-bold text-slate-900">Clinical Workflow Shortcuts</h3>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -279,7 +247,7 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
               >
                 <Stethoscope className="w-5 h-5 text-blue-600 mb-2" />
                 <div className="text-xs font-bold text-slate-800">New Consultation</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Start AI case query</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">Start AI query</div>
               </button>
 
               <button
@@ -287,8 +255,8 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
                 className="p-3.5 bg-slate-50 hover:bg-teal-50 border border-slate-200 hover:border-teal-300 rounded-xl text-left transition-all cursor-pointer"
               >
                 <Upload className="w-5 h-5 text-teal-600 mb-2" />
-                <div className="text-xs font-bold text-slate-800">Upload Report</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">PDF auto-chunking</div>
+                <div className="text-xs font-bold text-slate-800">Upload PDF</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">Vector index</div>
               </button>
 
               <button
@@ -297,7 +265,7 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
               >
                 <Activity className="w-5 h-5 text-purple-600 mb-2" />
                 <div className="text-xs font-bold text-slate-800">Record Vitals</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Nurse triage entry</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">Nurse triage</div>
               </button>
 
               <button
@@ -306,15 +274,13 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
               >
                 <FlaskConical className="w-5 h-5 text-amber-600 mb-2" />
                 <div className="text-xs font-bold text-slate-800">Guidelines Base</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">FAISS vector status</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">FAISS Vectors</div>
               </button>
             </div>
           </div>
         </div>
 
-        {/* Right 1 Col: Recent Consultations & Knowledge Base Feed */}
         <div className="space-y-6">
-          {/* Recent Consultations */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-slate-900">Recent Consultations</h3>
@@ -352,32 +318,6 @@ export const DashboardHome: React.FC<DashboardHomeProps> = ({
                 ))}
               </div>
             )}
-          </div>
-
-          {/* Active Medical Guidelines */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900">Active Knowledge Base</h3>
-              <span className="text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-full">
-                Vector Indexed
-              </span>
-            </div>
-
-            <div className="space-y-2.5">
-              {kbDocs.map((doc) => (
-                <div key={doc.id} className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between">
-                  <div className="flex items-center space-x-2.5 truncate">
-                    <FileText className="w-4 h-4 text-blue-600 shrink-0" />
-                    <span className="text-xs font-semibold text-slate-800 truncate">
-                      {doc.name}
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-mono text-slate-500 bg-slate-200 px-1.5 py-0.5 rounded shrink-0">
-                    {doc.chunk_count} chunks
-                  </span>
-                </div>
-              ))}
-            </div>
           </div>
         </div>
       </div>

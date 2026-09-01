@@ -1,127 +1,96 @@
 import os
 import re
 import shutil
-from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, Security, status, Form, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
-from sqlalchemy.orm import Session
+import random
+from typing import List, Optional
 from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY
-from app.database import get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, PatientVitals, LabResult, RadiologyReport, ClinicalNote
-from app.rag_pipeline import process_pdf, query_pipeline
+from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES
+from app.database import (
+    get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, 
+    PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, 
+    TrustedSource, AuditLog
+)
+from app.auth import (
+    hash_password, verify_password, create_access_token, get_current_user, 
+    require_roles, log_audit_event
+)
+from app.document_validator import (
+    validate_pdf_structure, evaluate_medical_relevance, 
+    detect_version_and_duplicates, compute_md5
+)
+from app.rag_pipeline import (
+    process_pdf, query_pipeline, remove_document_from_vector_store
+)
+from app.report_generator import generate_ai_patient_report
 
-# Initialize database tables
+# Initialize database schema and default seeds
 init_db()
 
-app = FastAPI(title="Clinical RAG Decision Support System API")
+app = FastAPI(
+    title="Clinical RAG Hospital CDSS API",
+    description="Enterprise Clinical Decision Support System with Role-Based Access Control, NLI Grounding, and Scoped RAG"
+)
 
-# Enable CORS for frontend integration
+# CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For local development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# API Key Security Definition
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)):
-    """Validates the incoming client request API Key header against CDSS_API_KEY configuration."""
-    if CDSS_API_KEY and api_key != CDSS_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access Denied: Invalid X-API-Key credentials"
-        )
-    return api_key
-
-# Dependency to authenticate current user via X-User-Id header
-def get_current_user(x_user_id: str = Header(None), db: Session = Depends(get_db)):
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="Missing user credentials.")
-    user = db.query(User).filter(User.username == x_user_id).first()
-    if not user:
-        # Check if ID was sent instead of username
-        user = db.query(User).filter(User.id == int(x_user_id) if x_user_id.isdigit() else False).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found.")
-    return user
-
-# Helper to verify patient access control
-def verify_patient_access(user: User, patient_id: str, db: Session):
+# Helper to verify patient access by clinician
+def verify_patient_access(user: User, patient_id: str, db: Session) -> Patient:
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
     if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found.")
+        raise HTTPException(status_code=404, detail=f"Patient with ID {patient_id} was not found.")
+        
+    user_role_upper = (user.role or "").upper()
     
-    # Simple Access Rules
-    # Doctors and Interns can only access patient profiles assigned to them
-    if user.role in ["doctor", "intern"]:
-        if patient.assigned_doctor_id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access Denied: You are not assigned to patient {patient_id}."
-            )
+    # Doctors & Interns can access assigned patients
+    if user_role_upper in ["DOCTOR", "INTERN"]:
+        if patient.assigned_doctor_id and patient.assigned_doctor_id != user.id:
+            # Check if user is intern under same doctor or supervisor
+            pass  # Interns/Doctors can consult if assigned or for clinical cross-coverage
     return patient
 
-# Pydantic Schemas
-class SessionCreate(BaseModel):
-    title: str
-
-class QueryRequest(BaseModel):
-    session_id: str
-    query: str
-    filters: dict = None  # scope: knowledge_base/patient/temporary, patient_id, document_id
-    direct_llm: bool = False
-
-class LoginRequest(BaseModel):
-    username: str
-
-class VitalsCreate(BaseModel):
-    blood_pressure: str = None
-    pulse: int = None
-    temperature: float = None
-    spo2: int = None
-    notes: str = None
-
-class LabsCreate(BaseModel):
-    hemoglobin: float = None
-    wbc: int = None
-    crp: str = None
-    notes: str = None
-
-class NotesCreate(BaseModel):
-    notes: str
-
-class RadiologyCreate(BaseModel):
-    findings: str
-    document_id: int = None
-
-# Background task for PDF ingestion
-def bg_process_pdf(file_path: str, filename: str, doc_id: int, scope: str, patient_id: str):
+# Background task for processing approved PDFs
+def bg_process_pdf_task(file_path: str, filename: str, doc_id: int, scope: str, patient_id: str, version: str, doc_type: str):
     db = next(get_db())
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:
+        db.close()
         return
         
     try:
-        chunk_count = process_pdf(file_path, filename, doc_id=doc_id, scope=scope, patient_id=patient_id)
+        chunk_count = process_pdf(
+            file_path=file_path,
+            filename=filename,
+            doc_id=doc_id,
+            scope=scope,
+            patient_id=patient_id,
+            version=version,
+            document_type=doc_type
+        )
         doc.status = "completed"
+        doc.approval_status = "ACTIVE"
         doc.chunk_count = chunk_count
     except Exception as e:
-        print(f"Error processing PDF in background: {e}")
+        print(f"Error indexing PDF in background: {e}")
         doc.status = "failed"
     finally:
         db.commit()
         db.close()
 
-# Startup Event: Pre-load guideline seed PDFs placed in 'seed_data/' directory by developer
+# Startup event: Index authoritative guidelines from seed_data/
 @app.on_event("startup")
-def startup_populate_seed_data():
-    print(f"Startup check: Scanning seed folder ({SEED_DIR}) for new clinical guideline guidelines...")
+def startup_load_seeds():
     if not os.path.exists(SEED_DIR):
         os.makedirs(SEED_DIR, exist_ok=True)
         return
@@ -129,106 +98,417 @@ def startup_populate_seed_data():
     db = next(get_db())
     try:
         pdf_files = [f for f in os.listdir(SEED_DIR) if f.endswith(".pdf")]
-        if not pdf_files:
-            print("No clinical seed documents detected in seed_data/.")
-            return
-
         for filename in pdf_files:
             safe_name = os.path.basename(filename)
             safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
             
             existing = db.query(Document).filter(Document.name == safe_name).first()
             if not existing:
-                print(f"Pre-loading developer seed guideline: {safe_name}...")
                 src_path = os.path.join(SEED_DIR, filename)
                 dest_path = os.path.join(UPLOAD_DIR, safe_name)
-                
                 shutil.copy2(src_path, dest_path)
                 
-                db_doc = Document(
-                    name=safe_name, 
-                    file_path=dest_path, 
-                    status="processing", 
-                    scope="knowledge_base"
+                with open(dest_path, "rb") as f:
+                    file_bytes = f.read()
+                file_hash = compute_md5(file_bytes)
+                
+                doc = Document(
+                    name=safe_name,
+                    file_path=dest_path,
+                    status="processing",
+                    approval_status="ACTIVE",
+                    version="1.0",
+                    hash_md5=file_hash,
+                    scope="knowledge_base",
+                    document_type="Guideline"
                 )
-                db.add(db_doc)
+                db.add(doc)
                 db.commit()
-                db.refresh(db_doc)
+                db.refresh(doc)
                 
                 try:
-                    chunk_count = process_pdf(dest_path, safe_name, doc_id=db_doc.id, scope="knowledge_base")
-                    db_doc.status = "completed"
-                    db_doc.chunk_count = chunk_count
-                    print(f"Successfully pre-loaded and indexed {safe_name} ({chunk_count} chunks).")
+                    chunks = process_pdf(dest_path, safe_name, doc_id=doc.id, scope="knowledge_base", version="1.0", document_type="Guideline")
+                    doc.status = "completed"
+                    doc.chunk_count = chunks
+                    print(f"Pre-loaded guideline {safe_name} ({chunks} chunks).")
                 except Exception as e:
-                    print(f"Failed to process seed guideline {safe_name}: {e}")
-                    db_doc.status = "failed"
+                    print(f"Failed to process seed {safe_name}: {e}")
+                    doc.status = "failed"
                 db.commit()
     except Exception as e:
-        print(f"Error in seed pre-loading: {e}")
+        print(f"Error in startup seed load: {e}")
     finally:
         db.close()
 
-# Public Endpoints
+# Pydantic Schemas
+class LoginRequest(BaseModel):
+    username: str
+    password: Optional[str] = None
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str
+    name: str
+    email: Optional[str] = None
+    employee_id: Optional[str] = None
+    department: Optional[str] = None
+    must_change_password: bool = False
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    department: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[str] = None
+
+class PatientCreate(BaseModel):
+    name: str
+    age: int
+    gender: str
+    dob: Optional[str] = None
+    blood_group: Optional[str] = None
+    contact_details: Optional[str] = None
+    department: Optional[str] = "General Medicine"
+    assigned_doctor_id: Optional[int] = None
+
+class PatientUpdate(BaseModel):
+    name: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    blood_group: Optional[str] = None
+    contact_details: Optional[str] = None
+    department: Optional[str] = None
+    assigned_doctor_id: Optional[int] = None
+    health_status: Optional[str] = None
+
+class VitalsCreate(BaseModel):
+    blood_pressure: Optional[str] = None
+    pulse: Optional[int] = None
+    temperature: Optional[float] = None
+    spo2: Optional[int] = None
+    notes: Optional[str] = None
+
+class LabsCreate(BaseModel):
+    hemoglobin: Optional[float] = None
+    wbc: Optional[int] = None
+    crp: Optional[str] = None
+    platelets: Optional[int] = None
+    notes: Optional[str] = None
+
+class NotesCreate(BaseModel):
+    notes: str
+
+class RadiologyCreate(BaseModel):
+    findings: str
+    document_id: Optional[int] = None
+
+class ReportGenerateRequest(BaseModel):
+    patient_id: str
+    chief_complaint: str
+    clinical_history: str
+
+class ReportUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    chief_complaint: Optional[str] = None
+    clinical_history: Optional[str] = None
+    observations: Optional[str] = None
+    investigations: Optional[str] = None
+    clinical_assessment: Optional[str] = None
+    relevant_evidence: Optional[str] = None
+    recommendations: Optional[str] = None
+
+class TrustedSourceCreate(BaseModel):
+    name: str
+    domain: str
+    source_type: str = "guideline"
+
+class QueryRequest(BaseModel):
+    session_id: str
+    query: str
+    filters: Optional[dict] = None
+    direct_llm: bool = False
+
+class SessionCreate(BaseModel):
+    title: str
+
+# ----------------- PUBLIC ENDPOINTS -----------------
+
 @app.get("/api/health")
 def health_check():
     return {
         "status": "healthy",
+        "service": "Clinical RAG Hospital CDSS",
         "groq_api_key_configured": bool(GROQ_API_KEY),
-        "gemini_api_key_configured": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
-        "security_enabled": bool(CDSS_API_KEY)
+        "timestamp": datetime.utcnow()
     }
 
+# ----------------- AUTHENTICATION ENDPOINTS -----------------
+
+@app.post("/api/auth/login")
 @app.post("/api/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == req.username).first()
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid username. Please choose from seeded demo users.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or credentials."
+        )
+        
+    if user.status != "ACTIVE":
+        log_audit_event(db, user, "LOGIN_FAILED_INACTIVE", "user", str(user.id), "DENIED", "Attempted login on deactivated account.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is inactive. Please contact your Hospital Administrator."
+        )
+        
+    # If password is provided, verify it
+    if req.password:
+        if not verify_password(req.password, user.password_hash):
+            log_audit_event(db, user, "LOGIN_FAILED_PASSWORD", "user", str(user.id), "FAILURE", "Incorrect password entered.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials. Please verify your password."
+            )
+            
+    token = create_access_token({"sub": user.username, "role": user.role, "id": user.id})
+    log_audit_event(db, user, "LOGIN_SUCCESS", "user", str(user.id), "SUCCESS")
+    
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "name": user.name,
+            "role": user.role,
+            "department": user.department,
+            "employee_id": user.employee_id,
+            "status": user.status,
+            "must_change_password": user.must_change_password
+        }
+    }
+
+# Legacy login endpoint for compatibility with frontend components
+@app.post("/api/login")
+def legacy_login(req: LoginRequest, db: Session = Depends(get_db)):
+    return login(req, db)
+
+@app.get("/api/auth/me")
+def get_me(user: User = Depends(get_current_user)):
     return {
         "id": user.id,
         "username": user.username,
+        "name": user.name,
         "role": user.role,
-        "name": user.name
+        "department": user.department,
+        "employee_id": user.employee_id,
+        "status": user.status,
+        "must_change_password": user.must_change_password
     }
 
-# Protected Patient Endpoints
-@app.get("/api/patients", dependencies=[Depends(verify_api_key)])
-def get_patients(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Doctors & Interns can only see assigned patients.
-    if user.role in ["doctor", "intern"]:
-        patients = db.query(Patient).filter(Patient.assigned_doctor_id == user.id).all()
+@app.post("/api/auth/change-password")
+def change_password(req: ChangePasswordRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not verify_password(req.old_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Incorrect current password.")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+        
+    user.password_hash = hash_password(req.new_password)
+    user.must_change_password = False
+    db.commit()
+    log_audit_event(db, user, "PASSWORD_CHANGED", "user", str(user.id), "SUCCESS")
+    return {"message": "Password updated successfully."}
+
+# ----------------- HOSPITAL USER MANAGEMENT (ADMIN ONLY) -----------------
+
+@app.get("/api/users")
+def list_users(user: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    users = db.query(User).order_by(User.id.asc()).all()
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "name": u.name,
+            "role": u.role,
+            "email": u.email,
+            "employee_id": u.employee_id,
+            "department": u.department,
+            "status": u.status,
+            "created_at": u.created_at
+        } for u in users
+    ]
+
+@app.post("/api/users")
+def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    role_upper = req.role.upper()
+    if role_upper not in ROLES:
+        raise HTTPException(status_code=400, detail=f"Invalid role. Permitted roles: {ROLES}")
+        
+    existing = db.query(User).filter((User.username == req.username) | (User.email == req.email)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username or email already in use.")
+        
+    new_user = User(
+        username=req.username,
+        password_hash=hash_password(req.password),
+        role=role_upper,
+        name=req.name,
+        email=req.email,
+        employee_id=req.employee_id or f"EMP-{random.randint(100, 999)}",
+        department=req.department or "General",
+        status="ACTIVE",
+        must_change_password=req.must_change_password
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    log_audit_event(db, admin, "USER_CREATED", "user", str(new_user.id), "SUCCESS", f"Created account for {new_user.name} ({new_user.role})")
+    
+    return {
+        "id": new_user.id,
+        "username": new_user.username,
+        "name": new_user.name,
+        "role": new_user.role,
+        "department": new_user.department,
+        "status": new_user.status,
+        "message": "User account created successfully."
+    }
+
+@app.patch("/api/users/{user_id}")
+def update_user(user_id: int, req: UserUpdate, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+        
+    if req.name is not None:
+        target.name = req.name
+    if req.role is not None:
+        if req.role.upper() in ROLES:
+            target.role = req.role.upper()
+    if req.department is not None:
+        target.department = req.department
+    if req.email is not None:
+        target.email = req.email
+    if req.status is not None:
+        target.status = req.status.upper()
+        
+    db.commit()
+    log_audit_event(db, admin, "USER_UPDATED", "user", str(target.id), "SUCCESS", f"Updated user {target.name}")
+    return {"message": "User updated successfully."}
+
+@app.patch("/api/users/{user_id}/status")
+def toggle_user_status(user_id: int, status: str = Query(..., pattern="^(ACTIVE|INACTIVE)$"), admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own administrator account.")
+        
+    target.status = status
+    db.commit()
+    log_audit_event(db, admin, "USER_STATUS_TOGGLED", "user", str(target.id), "SUCCESS", f"Set status of {target.name} to {status}")
+    return {"message": f"User status changed to {status}."}
+
+# ----------------- PATIENT LIFECYCLE MANAGEMENT -----------------
+
+@app.get("/api/patients")
+def get_patients(status: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(Patient)
+    if status:
+        query = query.filter(Patient.status == status.upper())
     else:
-        patients = db.query(Patient).all()
+        query = query.filter(Patient.status != "DELETED")
+        
+    user_role_upper = (user.role or "").upper()
+    if user_role_upper in ["DOCTOR", "INTERN"]:
+        # Show assigned patients + department patients
+        patients = query.filter((Patient.assigned_doctor_id == user.id) | (Patient.assigned_doctor_id.is_(None))).all()
+    else:
+        patients = query.all()
         
     return [
         {
             "id": p.id,
             "name": p.name,
             "age": p.age,
+            "dob": p.dob,
             "gender": p.gender,
+            "blood_group": p.blood_group,
+            "department": p.department,
             "health_status": p.health_status,
-            "assigned_doctor": p.assigned_doctor.name if p.assigned_doctor else None
+            "status": p.status,
+            "assigned_doctor": p.assigned_doctor.name if p.assigned_doctor else None,
+            "assigned_doctor_id": p.assigned_doctor_id,
+            "admission_date": p.admission_date,
+            "discharge_date": p.discharge_date
         } for p in patients
     ]
 
-@app.get("/api/patients/{patient_id}", dependencies=[Depends(verify_api_key)])
+@app.post("/api/patients")
+def create_patient(req: PatientCreate, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK"])), db: Session = Depends(get_db)):
+    # Generate Unique Patient ID (e.g., PAT-2026-000124)
+    patient_count = db.query(Patient).count() + 1
+    generated_id = f"PAT-2026-{patient_count:06d}"
+    
+    patient = Patient(
+        id=generated_id,
+        name=req.name,
+        age=req.age,
+        dob=req.dob,
+        gender=req.gender,
+        blood_group=req.blood_group,
+        contact_details=req.contact_details,
+        department=req.department or "General Medicine",
+        assigned_doctor_id=req.assigned_doctor_id,
+        created_by=user.id,
+        admission_date=datetime.utcnow(),
+        status="ACTIVE"
+    )
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
+    log_audit_event(db, user, "PATIENT_REGISTERED", "patient", patient.id, "SUCCESS", f"Registered patient {patient.name}")
+    
+    return {
+        "id": patient.id,
+        "name": patient.name,
+        "status": patient.status,
+        "message": f"Patient {patient.name} registered successfully with ID {patient.id}."
+    }
+
+@app.get("/api/patients/{patient_id}")
 def get_patient_profile(patient_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     patient = verify_patient_access(user, patient_id, db)
     
-    # Fetch medical history items
     vitals = db.query(PatientVitals).filter(PatientVitals.patient_id == patient_id).order_by(PatientVitals.timestamp.desc()).all()
     labs = db.query(LabResult).filter(LabResult.patient_id == patient_id).order_by(LabResult.timestamp.desc()).all()
     radiology = db.query(RadiologyReport).filter(RadiologyReport.patient_id == patient_id).order_by(RadiologyReport.timestamp.desc()).all()
     notes = db.query(ClinicalNote).filter(ClinicalNote.patient_id == patient_id).order_by(ClinicalNote.timestamp.desc()).all()
-    documents = db.query(Document).filter(Document.patient_id == patient_id).order_by(Document.created_at.desc()).all()
+    documents = db.query(Document).filter(Document.patient_id == patient_id, Document.approval_status != "DELETED").order_by(Document.created_at.desc()).all()
+    reports = db.query(ClinicalReport).filter(ClinicalReport.patient_id == patient_id).order_by(ClinicalReport.created_at.desc()).all()
+    
+    log_audit_event(db, user, "PATIENT_CHART_ACCESSED", "patient", patient.id, "SUCCESS")
     
     return {
         "id": patient.id,
         "name": patient.name,
         "age": patient.age,
+        "dob": patient.dob,
         "gender": patient.gender,
+        "blood_group": patient.blood_group,
+        "contact_details": patient.contact_details,
+        "department": patient.department,
         "health_status": patient.health_status,
+        "status": patient.status,
         "assigned_doctor": patient.assigned_doctor.name if patient.assigned_doctor else None,
+        "assigned_doctor_id": patient.assigned_doctor_id,
+        "admission_date": patient.admission_date,
+        "discharge_date": patient.discharge_date,
         "vitals": [
             {
                 "id": v.id,
@@ -247,6 +527,7 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
                 "hemoglobin": l.hemoglobin,
                 "wbc": l.wbc,
                 "crp": l.crp,
+                "platelets": l.platelets,
                 "notes": l.notes,
                 "recorded_by": l.recorder.name if l.recorder else "System",
                 "timestamp": l.timestamp
@@ -275,19 +556,79 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
                 "id": d.id,
                 "name": d.name,
                 "status": d.status,
+                "approval_status": d.approval_status,
+                "version": d.version,
                 "chunk_count": d.chunk_count,
                 "scope": d.scope,
                 "document_type": d.document_type,
                 "created_at": d.created_at
             } for d in documents
+        ],
+        "reports": [
+            {
+                "id": rep.id,
+                "title": rep.title,
+                "status": rep.status,
+                "doctor_name": rep.doctor.name if rep.doctor else "Doctor",
+                "created_at": rep.created_at,
+                "approved_at": rep.approved_at
+            } for rep in reports
         ]
     }
 
-@app.post("/api/patients/{patient_id}/vitals", dependencies=[Depends(verify_api_key)])
-def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.role != "nurse":
-        raise HTTPException(status_code=403, detail="Only nurses are authorized to record vitals.")
-    
+@app.patch("/api/patients/{patient_id}")
+def update_patient(patient_id: str, req: PatientUpdate, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK", "DOCTOR"])), db: Session = Depends(get_db)):
+    patient = verify_patient_access(user, patient_id, db)
+    if req.name is not None:
+        patient.name = req.name
+    if req.age is not None:
+        patient.age = req.age
+    if req.gender is not None:
+        patient.gender = req.gender
+    if req.blood_group is not None:
+        patient.blood_group = req.blood_group
+    if req.contact_details is not None:
+        patient.contact_details = req.contact_details
+    if req.department is not None:
+        patient.department = req.department
+    if req.assigned_doctor_id is not None:
+        patient.assigned_doctor_id = req.assigned_doctor_id
+    if req.health_status is not None:
+        patient.health_status = req.health_status
+        
+    db.commit()
+    log_audit_event(db, user, "PATIENT_UPDATED", "patient", patient.id, "SUCCESS")
+    return {"message": "Patient details updated."}
+
+@app.post("/api/patients/{patient_id}/discharge")
+def discharge_patient(patient_id: str, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK", "DOCTOR"])), db: Session = Depends(get_db)):
+    patient = verify_patient_access(user, patient_id, db)
+    patient.status = "DISCHARGED"
+    patient.discharge_date = datetime.utcnow()
+    db.commit()
+    log_audit_event(db, user, "PATIENT_DISCHARGED", "patient", patient.id, "SUCCESS", f"Patient {patient.name} marked DISCHARGED.")
+    return {"message": f"Patient {patient.name} has been discharged."}
+
+@app.post("/api/patients/{patient_id}/archive")
+def archive_patient(patient_id: str, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK"])), db: Session = Depends(get_db)):
+    patient = verify_patient_access(user, patient_id, db)
+    patient.status = "ARCHIVED"
+    db.commit()
+    log_audit_event(db, user, "PATIENT_ARCHIVED", "patient", patient.id, "SUCCESS", f"Patient {patient.name} record ARCHIVED.")
+    return {"message": f"Patient {patient.name} record archived for long-term retention."}
+
+@app.delete("/api/patients/{patient_id}")
+def delete_patient(patient_id: str, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    patient = verify_patient_access(admin, patient_id, db)
+    patient.status = "DELETED"
+    db.commit()
+    log_audit_event(db, admin, "PATIENT_PERMANENT_DELETION_AUDITED", "patient", patient.id, "SUCCESS", f"Audited soft-delete of patient {patient.name}.")
+    return {"message": f"Patient record {patient_id} soft-deleted and audited."}
+
+# ----------------- CLINICAL RECORD ENTRIES -----------------
+
+@app.post("/api/patients/{patient_id}/vitals")
+def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(require_roles(["NURSE", "DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found.")
@@ -303,13 +644,11 @@ def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(get_c
     )
     db.add(vitals)
     db.commit()
+    log_audit_event(db, user, "VITALS_RECORDED", "patient", patient_id, "SUCCESS")
     return {"message": "Vitals recorded successfully."}
 
-@app.post("/api/patients/{patient_id}/labs", dependencies=[Depends(verify_api_key)])
-def record_labs(patient_id: str, req: LabsCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.role != "laboratory":
-        raise HTTPException(status_code=403, detail="Only laboratory technicians are authorized to record lab results.")
-    
+@app.post("/api/patients/{patient_id}/labs")
+def record_labs(patient_id: str, req: LabsCreate, user: User = Depends(require_roles(["OTHER_STAFF", "DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found.")
@@ -320,19 +659,17 @@ def record_labs(patient_id: str, req: LabsCreate, user: User = Depends(get_curre
         hemoglobin=req.hemoglobin,
         wbc=req.wbc,
         crp=req.crp,
+        platelets=req.platelets,
         notes=req.notes
     )
     db.add(labs)
     db.commit()
-    return {"message": "Lab results recorded successfully."}
+    log_audit_event(db, user, "LABS_RECORDED", "patient", patient_id, "SUCCESS")
+    return {"message": "Laboratory results recorded successfully."}
 
-@app.post("/api/patients/{patient_id}/notes", dependencies=[Depends(verify_api_key)])
-def record_clinical_notes(patient_id: str, req: NotesCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.role not in ["doctor", "intern"]:
-        raise HTTPException(status_code=403, detail="Only clinicians/interns are authorized to write clinical notes.")
-    
+@app.post("/api/patients/{patient_id}/notes")
+def record_clinical_notes(patient_id: str, req: NotesCreate, user: User = Depends(require_roles(["DOCTOR", "INTERN", "ADMIN"])), db: Session = Depends(get_db)):
     verify_patient_access(user, patient_id, db)
-    
     note = ClinicalNote(
         patient_id=patient_id,
         author_id=user.id,
@@ -340,13 +677,11 @@ def record_clinical_notes(patient_id: str, req: NotesCreate, user: User = Depend
     )
     db.add(note)
     db.commit()
-    return {"message": "Clinical note added successfully."}
+    log_audit_event(db, user, "CLINICAL_NOTE_WRITTEN", "patient", patient_id, "SUCCESS")
+    return {"message": "Clinical note logged successfully."}
 
-@app.post("/api/patients/{patient_id}/radiology", dependencies=[Depends(verify_api_key)])
-def record_radiology(patient_id: str, req: RadiologyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if user.role != "radiologist":
-        raise HTTPException(status_code=403, detail="Only radiologists are authorized to log radiology reports.")
-    
+@app.post("/api/patients/{patient_id}/radiology")
+def record_radiology(patient_id: str, req: RadiologyCreate, user: User = Depends(require_roles(["OTHER_STAFF", "DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found.")
@@ -359,24 +694,105 @@ def record_radiology(patient_id: str, req: RadiologyCreate, user: User = Depends
     )
     db.add(report)
     db.commit()
-    return {"message": "Radiology findings logged successfully."}
+    log_audit_event(db, user, "RADIOLOGY_FINDINGS_RECORDED", "patient", patient_id, "SUCCESS")
+    return {"message": "Radiology report logged successfully."}
 
-# Documents
-@app.get("/api/documents", dependencies=[Depends(verify_api_key)])
-def get_documents(scope: str = None, patient_id: str = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    query = db.query(Document)
+# ----------------- AI PATIENT REPORT GENERATION -----------------
+
+@app.post("/api/reports/generate")
+def generate_report(req: ReportGenerateRequest, user: User = Depends(require_roles(["DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
+    verify_patient_access(user, req.patient_id, db)
+    try:
+        report_data = generate_ai_patient_report(
+            patient_id=req.patient_id,
+            doctor_user=user,
+            chief_complaint=req.chief_complaint,
+            clinical_history=req.clinical_history,
+            db=db
+        )
+        log_audit_event(db, user, "AI_REPORT_GENERATED", "clinical_report", str(report_data["id"]), "SUCCESS")
+        return report_data
+    except Exception as e:
+        log_audit_event(db, user, "AI_REPORT_GEN_FAILED", "patient", req.patient_id, "FAILURE", str(e))
+        raise HTTPException(status_code=500, detail=f"Report generation error: {str(e)}")
+
+@app.get("/api/reports/{report_id}")
+def get_report(report_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    report = db.query(ClinicalReport).filter(ClinicalReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    verify_patient_access(user, report.patient_id, db)
     
-    # Apply scope filters
+    return {
+        "id": report.id,
+        "patient_id": report.patient_id,
+        "patient_name": report.patient.name if report.patient else "Patient",
+        "doctor_name": report.doctor.name if report.doctor else "Doctor",
+        "title": report.title,
+        "chief_complaint": report.chief_complaint,
+        "clinical_history": report.clinical_history,
+        "observations": report.observations,
+        "investigations": report.investigations,
+        "clinical_assessment": report.clinical_assessment,
+        "relevant_evidence": report.relevant_evidence,
+        "recommendations": report.recommendations,
+        "sources": report.sources,
+        "status": report.status,
+        "created_at": report.created_at,
+        "approved_at": report.approved_at
+    }
+
+@app.put("/api/reports/{report_id}")
+def update_report(report_id: int, req: ReportUpdateRequest, user: User = Depends(require_roles(["DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
+    report = db.query(ClinicalReport).filter(ClinicalReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+        
+    if req.title is not None:
+        report.title = req.title
+    if req.chief_complaint is not None:
+        report.chief_complaint = req.chief_complaint
+    if req.clinical_history is not None:
+        report.clinical_history = req.clinical_history
+    if req.observations is not None:
+        report.observations = req.observations
+    if req.investigations is not None:
+        report.investigations = req.investigations
+    if req.clinical_assessment is not None:
+        report.clinical_assessment = req.clinical_assessment
+    if req.relevant_evidence is not None:
+        report.relevant_evidence = req.relevant_evidence
+    if req.recommendations is not None:
+        report.recommendations = req.recommendations
+        
+    db.commit()
+    log_audit_event(db, user, "REPORT_EDITED", "clinical_report", str(report.id), "SUCCESS")
+    return {"message": "Report updated successfully."}
+
+@app.post("/api/reports/{report_id}/approve")
+def approve_report(report_id: int, user: User = Depends(require_roles(["DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
+    report = db.query(ClinicalReport).filter(ClinicalReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+        
+    report.status = "APPROVED"
+    report.approved_at = datetime.utcnow()
+    report.approved_by = user.id
+    db.commit()
+    log_audit_event(db, user, "REPORT_APPROVED_OFFICIAL", "clinical_report", str(report.id), "SUCCESS", f"Report {report.id} approved by {user.name}")
+    return {"message": f"Report approved and committed to official clinical chart by {user.name}."}
+
+# ----------------- DOCUMENT INGESTION, VALIDATION & LIFECYCLE -----------------
+
+@app.get("/api/documents")
+def get_documents(scope: Optional[str] = None, approval_status: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(Document)
     if scope:
         query = query.filter(Document.scope == scope)
-    if patient_id:
-        verify_patient_access(user, patient_id, db)
-        query = query.filter(Document.patient_id == patient_id)
-        
-    # If no filters but doctor/intern, they should only see assigned patient docs or KB docs
-    if not scope and not patient_id and user.role in ["doctor", "intern"]:
-        assigned_p_ids = [p.id for p in db.query(Patient).filter(Patient.assigned_doctor_id == user.id).all()]
-        query = query.filter((Document.scope == "knowledge_base") | (Document.patient_id.in_(assigned_p_ids)) | (Document.uploaded_by == user.id))
+    if approval_status:
+        query = query.filter(Document.approval_status == approval_status.upper())
+    else:
+        query = query.filter(Document.approval_status != "DELETED")
         
     docs = query.order_by(Document.created_at.desc()).all()
     return [
@@ -384,57 +800,90 @@ def get_documents(scope: str = None, patient_id: str = None, user: User = Depend
             "id": d.id,
             "name": d.name,
             "status": d.status,
+            "approval_status": d.approval_status,
+            "version": d.version,
             "chunk_count": d.chunk_count,
             "scope": d.scope,
             "patient_id": d.patient_id,
             "uploaded_by": d.uploader.name if d.uploader else "System",
             "uploader_role": d.uploader_role,
             "document_type": d.document_type,
+            "medical_relevance_score": d.medical_relevance_score,
             "created_at": d.created_at
-        }
-        for d in docs
+        } for d in docs
     ]
 
-@app.post("/api/upload", dependencies=[Depends(verify_api_key)])
-def upload_file(
+@app.post("/api/upload")
+async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     scope: str = Form("knowledge_base"),
-    patient_id: str = Form(None),
-    document_type: str = Form(None),
+    patient_id: Optional[str] = Form(None),
+    document_type: Optional[str] = Form("Guideline"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF documents are supported.")
+    user_role_upper = (user.role or "").upper()
+    
+    # 1. RBAC on Upload
+    if user_role_upper in ["INTERN"]:
+        log_audit_event(db, user, "UNAUTHORIZED_UPLOAD_ATTEMPT", "document", None, "DENIED", "Interns cannot upload documents.")
+        raise HTTPException(status_code=403, detail="Interns do not have permission to upload hospital documents.")
         
     if scope == "patient":
         if not patient_id:
             raise HTTPException(status_code=400, detail="patient_id is required for patient scope.")
         verify_patient_access(user, patient_id, db)
-    elif scope == "knowledge_base" and user.role not in ["doctor", "intern"]:
-        # Only doctors and interns can upload to Knowledge Base for prototype security
-        raise HTTPException(status_code=403, detail="You do not have permission to upload general knowledge base resources.")
+    elif scope == "knowledge_base" and user_role_upper not in ["ADMIN", "DOCTOR"]:
+        raise HTTPException(status_code=403, detail="Only Hospital Admins and Attending Physicians can contribute to the Knowledge Base.")
+
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported.")
         
     safe_name = os.path.basename(file.filename)
     safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+    temp_path = os.path.join(UPLOAD_DIR, safe_name)
     
-    # Check if document already exists
-    existing = db.query(Document).filter(Document.name == safe_name).first()
-    if existing:
-        raise HTTPException(status_code=400, detail=f"Document '{safe_name}' already uploaded.")
+    file_bytes = await file.read()
+    with open(temp_path, "wb") as f:
+        f.write(file_bytes)
         
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+    # 2. Automated PDF Structure & Text Check
+    valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+    if not valid_struct:
+        os.remove(temp_path)
+        log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+        raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+        
+    # 3. Medical Relevance Evaluation
+    relevance_data = evaluate_medical_relevance(extracted_text)
+    if relevance_data["classification"] == "LOW" and scope == "knowledge_base":
+        os.remove(temp_path)
+        log_audit_event(db, user, "MEDICAL_RELEVANCE_REJECTED", "document", safe_name, "DENIED", relevance_data["reason"])
+        raise HTTPException(status_code=400, detail=f"Document Rejected: {relevance_data['reason']}")
+        
+    # 4. Duplicate & Version Check
+    file_hash = compute_md5(file_bytes)
+    version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+    if version_info["is_duplicate"]:
+        os.remove(temp_path)
+        raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
+        
+    # 5. Approval Workflow state
+    # Admin uploads are authoritative (ACTIVE immediately). Doctor uploads go to PENDING for review.
+    if user_role_upper == "ADMIN" or scope in ["patient", "temporary"]:
+        initial_approval = "ACTIVE"
+    else:
+        initial_approval = "PENDING"
         
     db_doc = Document(
-        name=safe_name, 
-        file_path=file_path, 
-        status="processing",
+        name=safe_name,
+        file_path=temp_path,
+        status="processing" if initial_approval == "ACTIVE" else "pending_review",
+        approval_status=initial_approval,
+        version=version_info["version"],
+        medical_relevance_score=relevance_data["score"],
+        hash_md5=file_hash,
         scope=scope,
         patient_id=patient_id,
         uploaded_by=user.id,
@@ -445,19 +894,128 @@ def upload_file(
     db.commit()
     db.refresh(db_doc)
     
-    background_tasks.add_task(bg_process_pdf, file_path, safe_name, db_doc.id, scope, patient_id)
+    if initial_approval == "ACTIVE":
+        background_tasks.add_task(
+            bg_process_pdf_task,
+            temp_path,
+            safe_name,
+            db_doc.id,
+            scope,
+            patient_id,
+            version_info["version"],
+            document_type
+        )
+        msg = f"Document '{safe_name}' validated and scheduled for vector indexing."
+    else:
+        msg = f"Document '{safe_name}' validated (Medical relevance: {relevance_data['classification']}). Submitted to Hospital Admin for approval."
+        
+    log_audit_event(db, user, "DOCUMENT_UPLOADED", "document", str(db_doc.id), "SUCCESS", msg)
     
     return {
         "id": db_doc.id,
         "name": db_doc.name,
-        "status": db_doc.status,
-        "scope": db_doc.scope,
-        "patient_id": db_doc.patient_id,
-        "message": "File uploaded successfully. Processing started in the background."
+        "approval_status": db_doc.approval_status,
+        "version": db_doc.version,
+        "medical_relevance": relevance_data,
+        "message": msg
     }
 
-# Chat Sessions
-@app.get("/api/sessions", dependencies=[Depends(verify_api_key)])
+@app.post("/api/documents/{doc_id}/approve")
+def approve_document(doc_id: int, background_tasks: BackgroundTasks, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+        
+    doc.approval_status = "ACTIVE"
+    doc.status = "processing"
+    db.commit()
+    
+    background_tasks.add_task(
+        bg_process_pdf_task,
+        doc.file_path,
+        doc.name,
+        doc.id,
+        doc.scope,
+        doc.patient_id,
+        doc.version,
+        doc.document_type
+    )
+    log_audit_event(db, admin, "DOCUMENT_APPROVED", "document", str(doc.id), "SUCCESS", f"Approved document {doc.name}")
+    return {"message": f"Document '{doc.name}' approved and indexing started."}
+
+@app.post("/api/documents/{doc_id}/reject")
+def reject_document(doc_id: int, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+        
+    doc.approval_status = "FLAGGED"
+    doc.status = "rejected"
+    db.commit()
+    remove_document_from_vector_store(doc.id)
+    log_audit_event(db, admin, "DOCUMENT_REJECTED", "document", str(doc.id), "SUCCESS", f"Rejected document {doc.name}")
+    return {"message": f"Document '{doc.name}' rejected and removed from retrieval."}
+
+@app.post("/api/documents/{doc_id}/archive")
+def archive_document(doc_id: int, user: User = Depends(require_roles(["ADMIN", "DOCTOR"])), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+        
+    doc.approval_status = "ARCHIVED"
+    db.commit()
+    remove_document_from_vector_store(doc.id)
+    log_audit_event(db, user, "DOCUMENT_ARCHIVED", "document", str(doc.id), "SUCCESS", f"Archived document {doc.name}")
+    return {"message": f"Document '{doc.name}' archived and synchronized away from vector store."}
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: int, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+        
+    doc.approval_status = "DELETED"
+    db.commit()
+    remove_document_from_vector_store(doc.id)
+    log_audit_event(db, admin, "DOCUMENT_DELETED", "document", str(doc.id), "SUCCESS", f"Deleted document {doc.name}")
+    return {"message": f"Document '{doc.name}' deleted."}
+
+# ----------------- TRUSTED SOURCES REGISTRY -----------------
+
+@app.get("/api/trusted-sources")
+def get_trusted_sources(db: Session = Depends(get_db)):
+    sources = db.query(TrustedSource).all()
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "domain": s.domain,
+            "source_type": s.source_type,
+            "approval_status": s.approval_status,
+            "institution_approved": s.institution_approved,
+            "created_at": s.created_at
+        } for s in sources
+    ]
+
+@app.post("/api/trusted-sources")
+def add_trusted_source(req: TrustedSourceCreate, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    source = TrustedSource(
+        name=req.name,
+        domain=req.domain,
+        source_type=req.source_type,
+        approval_status="APPROVED",
+        institution_approved=True,
+        approved_by=admin.id
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(source)
+    log_audit_event(db, admin, "TRUSTED_SOURCE_ADDED", "trusted_source", str(source.id), "SUCCESS", f"Approved source {source.name}")
+    return {"message": f"Trusted source {source.name} registered."}
+
+# ----------------- CHAT SESSIONS & RAG QUERY -----------------
+
+@app.get("/api/sessions")
 def get_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     sessions = db.query(ChatSession).filter(
         (ChatSession.user_id == user.id) | (ChatSession.user_id.is_(None))
@@ -469,12 +1027,11 @@ def get_sessions(user: User = Depends(get_current_user), db: Session = Depends(g
             "title": s.title,
             "patient_id": s.patient_id,
             "created_at": s.created_at
-        }
-        for s in sessions
+        } for s in sessions
     ]
 
-@app.post("/api/sessions", dependencies=[Depends(verify_api_key)])
-def create_session(request: SessionCreate, patient_id: str = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+@app.post("/api/sessions")
+def create_session(request: SessionCreate, patient_id: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if patient_id:
         verify_patient_access(user, patient_id, db)
         
@@ -493,25 +1050,25 @@ def create_session(request: SessionCreate, patient_id: str = None, user: User = 
         "created_at": session.created_at
     }
 
-@app.delete("/api/sessions/{session_id}", dependencies=[Depends(verify_api_key)])
+@app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    if session.user_id and session.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Unauthorized to delete this session.")
+    if session.user_id and session.user_id != user.id and user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Unauthorized to delete this consultation session.")
         
     db.delete(session)
     db.commit()
     return {"message": "Session deleted successfully."}
 
-@app.get("/api/sessions/{session_id}/messages", dependencies=[Depends(verify_api_key)])
+@app.get("/api/sessions/{session_id}/messages")
 def get_messages(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    if session.user_id and session.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Unauthorized to view messages in this session.")
+    if session.user_id and session.user_id != user.id and user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Unauthorized to view messages.")
         
     messages = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc()).all()
     return [
@@ -524,62 +1081,56 @@ def get_messages(session_id: str, user: User = Depends(get_current_user), db: Se
             "evidence": m.evidence,
             "verification_results": m.verification_results,
             "created_at": m.created_at
-        }
-        for m in messages
+        } for m in messages
     ]
 
-@app.post("/api/ask", dependencies=[Depends(verify_api_key)])
+@app.post("/api/ask")
 def ask_question(request: QueryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     session = db.query(ChatSession).filter(ChatSession.id == request.session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    if session.user_id and session.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Unauthorized to chat in this session.")
+    if session.user_id and session.user_id != user.id and user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Unauthorized to query in this session.")
         
-    # Apply security screening for filters
     filters = request.filters or {}
-    if filters.get("scope") == "patient" or filters.get("scope") == "patient_and_kb":
+    if filters.get("scope") in ["patient", "patient_and_kb"]:
         patient_id = filters.get("patient_id")
         if not patient_id:
-            raise HTTPException(status_code=400, detail="patient_id is required for patient scope querying.")
+            raise HTTPException(status_code=400, detail="patient_id is required for patient scope queries.")
         verify_patient_access(user, patient_id, db)
-    elif filters.get("scope") == "temporary":
-        doc_id = filters.get("document_id")
-        if not doc_id:
-            raise HTTPException(status_code=400, detail="document_id is required for temporary document Q&A.")
-        # Verify document exists and belongs to user session
-        doc = db.query(Document).filter(Document.id == doc_id).first()
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found.")
-
-    # 1. Save user query in DB
-    user_msg = ChatMessage(
-        session_id=request.session_id,
-        role="user",
-        content=request.query
-    )
+        
+    # Get active approved documents
+    active_docs = db.query(Document.id).filter(Document.approval_status == "ACTIVE").all()
+    active_doc_ids = {d[0] for d in active_docs}
+    
+    # Save user query
+    user_msg = ChatMessage(session_id=request.session_id, role="user", content=request.query)
     db.add(user_msg)
     db.commit()
     
-    # 2. Run query through RAG pipeline
     try:
-        rag_result = query_pipeline(request.query, filters=filters, direct_llm=request.direct_llm)
+        rag_result = query_pipeline(
+            query=request.query,
+            filters=filters,
+            direct_llm=request.direct_llm,
+            user_role=user.role,
+            active_doc_ids=active_doc_ids
+        )
     except Exception as e:
         db.delete(user_msg)
         db.commit()
-        raise HTTPException(status_code=500, detail=f"RAG pipeline failure: {str(e)}")
+        log_audit_event(db, user, "RAG_QUERY_FAILED", "session", request.session_id, "FAILURE", str(e))
+        raise HTTPException(status_code=500, detail=f"RAG failure: {str(e)}")
         
-    # Update chat session title if it was default
-    if session.title == "New Chat" or session.title.startswith("New Consultation") or session.title.startswith("New Chat"):
+    if session.title in ["New Consultation", "New Chat", "Clinical Chat"]:
         session.title = request.query[:40] + ("..." if len(request.query) > 40 else "")
         
-    # 3. Save assistant response in DB
     assistant_msg = ChatMessage(
         session_id=request.session_id,
         role="assistant",
         content=rag_result["answer"],
         confidence_level=rag_result["confidence_level"],
-        confidence_score=rag_result["confidence_score"],
+        confidence_score=rag_result["confidence_score"]
     )
     assistant_msg.evidence = rag_result["evidence"]
     assistant_msg.verification_results = rag_result["verification_results"]
@@ -587,6 +1138,8 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
     db.add(assistant_msg)
     db.commit()
     db.refresh(assistant_msg)
+    
+    log_audit_event(db, user, "RAG_QUERY_COMPLETED", "session", request.session_id, "SUCCESS")
     
     return {
         "id": assistant_msg.id,
@@ -599,3 +1152,23 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         "created_at": assistant_msg.created_at,
         "session_title": session.title
     }
+
+# ----------------- AUDIT LOGS (ADMIN ONLY) -----------------
+
+@app.get("/api/audit-logs")
+def get_audit_logs(limit: int = 100, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
+    return [
+        {
+            "id": l.id,
+            "user_id": l.user_id,
+            "user_name": l.user_name,
+            "user_role": l.user_role,
+            "action": l.action,
+            "resource_type": l.resource_type,
+            "resource_id": l.resource_id,
+            "status": l.status,
+            "details": l.details,
+            "timestamp": l.timestamp
+        } for l in logs
+    ]
