@@ -17,11 +17,14 @@ from app.config import RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP
 SECTION_PATTERNS = [
     r'^(?:SECTION|CHAPTER|PART)\s+\d+[:\s\-\.]+[^\n]+',
     r'^(?:DOCUMENT REF|APPROVAL COMMITTEE|HOSPITAL APPROVED|CENTRAL CLINICAL|DEPARTMENT OF)[^\n]+',
+    r'^#{1,3}\s+[^\n]+',
     r'^[A-Z0-9\s]{4,35}:$',  # Strictly standalone ALL CAPS headers
+    r'^(?:CHIEF COMPLAINT|CLINICAL HISTORY|OBSERVATIONS|INVESTIGATIONS|CLINICAL ASSESSMENT|RELEVANT EVIDENCE|RECOMMENDATIONS|SOURCES)[:\s]+',
 ]
 
 SUBSECTION_PATTERNS = [
     r'^\d+\.\d+\s+[A-Za-z0-9\s,\-\(\)]+',
+    r'^\*\*[^*]+\*\*[:\s]*',
 ]
 
 # Authority weights for medical sources
@@ -32,6 +35,8 @@ AUTHORITY_WEIGHTS = {
     "guideline": 0.90,
     "textbook": 0.80,
     "research_paper": 0.85,
+    "clinical_report": 0.80,
+    "ai_generated_report": 0.80,
     "blood_report": 0.75,
     "radiology_report": 0.75,
     "nursing_report": 0.70,

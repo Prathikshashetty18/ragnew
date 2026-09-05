@@ -26,7 +26,7 @@ from app.document_validator import (
 from app.rag_pipeline import (
     process_pdf, query_pipeline, remove_document_from_vector_store
 )
-from app.report_generator import generate_ai_patient_report
+from app.report_generator import generate_ai_patient_report, sync_report_to_knowledge_base
 
 # Initialize database schema and default seeds
 init_db()
@@ -647,6 +647,162 @@ def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(requi
     log_audit_event(db, user, "VITALS_RECORDED", "patient", patient_id, "SUCCESS")
     return {"message": "Vitals recorded successfully."}
 
+# ----------------- LABORATORY ENDPOINTS -----------------
+
+@app.get("/api/laboratory")
+def list_laboratory_records(
+    patient_id: Optional[str] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    query = db.query(LabResult)
+    if patient_id:
+        query = query.filter(LabResult.patient_id == patient_id)
+    records = query.order_by(LabResult.timestamp.desc()).all()
+    
+    return [
+        {
+            "id": l.id,
+            "patient_id": l.patient_id,
+            "patient_name": l.patient.name if l.patient else l.patient_id,
+            "hemoglobin": l.hemoglobin,
+            "wbc": l.wbc,
+            "crp": l.crp,
+            "platelets": l.platelets,
+            "notes": l.notes,
+            "recorded_by": str(l.recorded_by),
+            "technician_name": l.recorder.name if l.recorder else "Laboratory Staff",
+            "timestamp": l.timestamp.isoformat() if l.timestamp else datetime.utcnow().isoformat()
+        } for l in records
+    ]
+
+@app.post("/api/laboratory/upload")
+async def upload_laboratory_record(
+    background_tasks: BackgroundTasks,
+    patient_id: str = Form(...),
+    hemoglobin: Optional[str] = Form(None),
+    wbc: Optional[str] = Form(None),
+    crp: Optional[str] = Form(None),
+    platelets: Optional[str] = Form(None),
+    notes: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    user: User = Depends(require_roles(["OTHER_STAFF", "LABORATORY_TECHNICIAN", "DOCTOR", "ADMIN", "NURSE"])),
+    db: Session = Depends(get_db)
+):
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="patient_id is required.")
+        
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail=f"Patient '{patient_id}' not found.")
+        
+    hb_val = None
+    if hemoglobin not in (None, ""):
+        try:
+            hb_val = float(hemoglobin)
+        except (ValueError, TypeError):
+            pass
+
+    wbc_val = None
+    if wbc not in (None, ""):
+        try:
+            wbc_val = int(wbc)
+        except (ValueError, TypeError):
+            pass
+
+    plt_val = None
+    if platelets not in (None, ""):
+        try:
+            plt_val = int(platelets)
+        except (ValueError, TypeError):
+            pass
+
+    crp_val = crp if crp not in (None, "") else None
+    notes_val = notes if notes not in (None, "") else None
+
+    lab = LabResult(
+        patient_id=patient_id,
+        recorded_by=user.id,
+        hemoglobin=hb_val,
+        wbc=wbc_val,
+        crp=crp_val,
+        platelets=plt_val,
+        notes=notes_val
+    )
+    db.add(lab)
+    db.commit()
+    db.refresh(lab)
+    
+    doc_id = None
+    if file and file.filename:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported for laboratory attachments.")
+            
+        safe_name = os.path.basename(file.filename)
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+        temp_path = os.path.join(UPLOAD_DIR, safe_name)
+        
+        file_bytes = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+            
+        valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+        if not valid_struct:
+            os.remove(temp_path)
+            log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+            raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+            
+        file_hash = compute_md5(file_bytes)
+        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+        
+        if not version_info["is_duplicate"]:
+            db_doc = Document(
+                name=safe_name,
+                file_path=temp_path,
+                status="processing",
+                approval_status="ACTIVE",
+                version=version_info["version"],
+                medical_relevance_score=1.0,
+                hash_md5=file_hash,
+                scope="patient",
+                patient_id=patient_id,
+                uploaded_by=user.id,
+                uploader_role=user.role,
+                document_type="blood_report"
+            )
+            db.add(db_doc)
+            db.commit()
+            db.refresh(db_doc)
+            doc_id = db_doc.id
+            
+            background_tasks.add_task(
+                bg_process_pdf_task,
+                temp_path,
+                safe_name,
+                db_doc.id,
+                "patient",
+                patient_id,
+                version_info["version"],
+                "blood_report"
+            )
+            
+    log_audit_event(db, user, "LABORATORY_PANEL_RECORDED", "laboratory", str(lab.id), "SUCCESS", f"Recorded lab panel for patient {patient_id}")
+    
+    return {
+        "message": "Laboratory results recorded successfully.",
+        "id": lab.id,
+        "patient_id": lab.patient_id,
+        "patient_name": patient.name,
+        "hemoglobin": lab.hemoglobin,
+        "wbc": lab.wbc,
+        "crp": lab.crp,
+        "platelets": lab.platelets,
+        "notes": lab.notes,
+        "technician_name": user.name,
+        "document_id": doc_id,
+        "timestamp": lab.timestamp.isoformat() if lab.timestamp else datetime.utcnow().isoformat()
+    }
+
 @app.post("/api/patients/{patient_id}/labs")
 def record_labs(patient_id: str, req: LabsCreate, user: User = Depends(require_roles(["OTHER_STAFF", "DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
@@ -679,6 +835,149 @@ def record_clinical_notes(patient_id: str, req: NotesCreate, user: User = Depend
     db.commit()
     log_audit_event(db, user, "CLINICAL_NOTE_WRITTEN", "patient", patient_id, "SUCCESS")
     return {"message": "Clinical note logged successfully."}
+
+# ----------------- RADIOLOGY ENDPOINTS -----------------
+
+@app.get("/api/radiology")
+def list_radiology_records(
+    patient_id: Optional[str] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    query = db.query(RadiologyReport)
+    if patient_id:
+        query = query.filter(RadiologyReport.patient_id == patient_id)
+    records = query.order_by(RadiologyReport.timestamp.desc()).all()
+    
+    return [
+        {
+            "id": r.id,
+            "patient_id": r.patient_id,
+            "patient_name": r.patient.name if r.patient else r.patient_id,
+            "modality": r.modality or "X-Ray",
+            "findings": r.findings or "",
+            "impression": r.impression or "",
+            "image_path": r.image_path,
+            "document_id": r.document_id,
+            "status": r.status or "FINAL",
+            "radiologist_name": r.recorder.name if r.recorder else "Radiologist",
+            "timestamp": r.timestamp.isoformat() if r.timestamp else datetime.utcnow().isoformat()
+        } for r in records
+    ]
+
+@app.post("/api/radiology/upload")
+async def upload_radiology_record(
+    background_tasks: BackgroundTasks,
+    patient_id: str = Form(...),
+    modality: Optional[str] = Form("Chest X-Ray"),
+    findings: str = Form(...),
+    impression: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    user: User = Depends(require_roles(["RADIOLOGIST", "OTHER_STAFF", "DOCTOR", "ADMIN", "INTERN"])),
+    db: Session = Depends(get_db)
+):
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="patient_id is required.")
+        
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail=f"Patient '{patient_id}' not found.")
+        
+    if not findings or not findings.strip():
+        raise HTTPException(status_code=400, detail="findings is required.")
+        
+    doc_id = None
+    image_path = None
+    if file and file.filename:
+        filename_lower = file.filename.lower()
+        safe_name = os.path.basename(file.filename)
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+        temp_path = os.path.join(UPLOAD_DIR, safe_name)
+        
+        file_bytes = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+            
+        if filename_lower.endswith(".pdf"):
+            valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+            if not valid_struct:
+                os.remove(temp_path)
+                log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+                raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+                
+            file_hash = compute_md5(file_bytes)
+            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+            
+            if not version_info["is_duplicate"]:
+                db_doc = Document(
+                    name=safe_name,
+                    file_path=temp_path,
+                    status="processing",
+                    approval_status="ACTIVE",
+                    version=version_info["version"],
+                    medical_relevance_score=1.0,
+                    hash_md5=file_hash,
+                    scope="patient",
+                    patient_id=patient_id,
+                    uploaded_by=user.id,
+                    uploader_role=user.role,
+                    document_type="radiology_report"
+                )
+                db.add(db_doc)
+                db.commit()
+                db.refresh(db_doc)
+                doc_id = db_doc.id
+                
+                background_tasks.add_task(
+                    bg_process_pdf_task,
+                    temp_path,
+                    safe_name,
+                    db_doc.id,
+                    "patient",
+                    patient_id,
+                    version_info["version"],
+                    "radiology_report"
+                )
+            else:
+                existing_doc = db.query(Document).filter(Document.hash_md5 == file_hash).first()
+                if existing_doc:
+                    doc_id = existing_doc.id
+        else:
+            image_path = temp_path
+            
+    report = RadiologyReport(
+        patient_id=patient_id,
+        recorded_by=user.id,
+        modality=modality or "Chest X-Ray",
+        findings=findings.strip(),
+        impression=impression.strip() if impression else None,
+        image_path=image_path,
+        document_id=doc_id,
+        status="FINAL"
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    
+    log_audit_event(
+        db, user, "RADIOLOGY_REPORT_UPLOADED", "radiology", str(report.id), "SUCCESS",
+        f"Recorded {report.modality} report for patient {patient_id}"
+    )
+    
+    return {
+        "message": "Radiology record logged successfully for patient.",
+        "id": report.id,
+        "patient_id": report.patient_id,
+        "patient_name": patient.name,
+        "modality": report.modality,
+        "findings": report.findings,
+        "impression": report.impression,
+        "image_path": report.image_path,
+        "document_id": report.document_id,
+        "status": report.status,
+        "radiologist_name": user.name,
+        "timestamp": report.timestamp.isoformat() if report.timestamp else datetime.utcnow().isoformat()
+    }
 
 @app.post("/api/patients/{patient_id}/radiology")
 def record_radiology(patient_id: str, req: RadiologyCreate, user: User = Depends(require_roles(["OTHER_STAFF", "DOCTOR", "ADMIN"])), db: Session = Depends(get_db)):
@@ -767,6 +1066,11 @@ def update_report(report_id: int, req: ReportUpdateRequest, user: User = Depends
         report.recommendations = req.recommendations
         
     db.commit()
+    db.refresh(report)
+    
+    # Re-sync updated report to Knowledge Base
+    sync_report_to_knowledge_base(report, user, db)
+    
     log_audit_event(db, user, "REPORT_EDITED", "clinical_report", str(report.id), "SUCCESS")
     return {"message": "Report updated successfully."}
 
@@ -780,6 +1084,11 @@ def approve_report(report_id: int, user: User = Depends(require_roles(["DOCTOR",
     report.approved_at = datetime.utcnow()
     report.approved_by = user.id
     db.commit()
+    db.refresh(report)
+    
+    # Re-sync approved report to Knowledge Base
+    sync_report_to_knowledge_base(report, user, db)
+    
     log_audit_event(db, user, "REPORT_APPROVED_OFFICIAL", "clinical_report", str(report.id), "SUCCESS", f"Report {report.id} approved by {user.name}")
     return {"message": f"Report approved and committed to official clinical chart by {user.name}."}
 

@@ -63,3 +63,40 @@ def test_strict_rag_prompt_invariants():
     assert "Do NOT use any outside medical knowledge" in DEFAULT_STRICT_RAG_SYSTEM_PROMPT
     assert "Do NOT invent facts, diagnoses, dosages" in DEFAULT_STRICT_RAG_SYSTEM_PROMPT
     assert "Insufficient evidence in the hospital knowledge base to answer this question reliably." in DEFAULT_STRICT_RAG_SYSTEM_PROMPT
+
+def test_calibrated_confidence_score_calculation():
+    from app.retrievers import get_cross_encoder_model
+    embedder = get_embedding_model()
+    cross_encoder = get_cross_encoder_model()
+    evidence_chunks = [
+        {
+            "id": 101,
+            "text": "1.3 Empirical Antimicrobial Therapy. Outpatient / Low Risk: Amoxicillin 1g TID orally or Doxycycline 100mg BID.",
+            "pdf_name": "Hospital_Guideline_Pneumonia.pdf",
+            "page_number": 2,
+            "dense_score": 0.80,
+            "rerank_score": 0.96
+        }
+    ]
+
+    # 1. Strongly supported answer
+    answer = "For outpatient low-risk pneumonia, first-line oral therapy is Amoxicillin 1g three times daily or Doxycycline 100mg twice daily."
+    res = validate_response_with_nli(answer, evidence_chunks, embedder, cross_encoder=cross_encoder)
+    assert res["grounding_level"] == "Strongly Supported"
+    assert res["confidence_level"] == "High"
+    assert res["confidence_score"] >= 0.85
+    assert res["supported_claims"] == res["total_claims"]
+
+    # 2. Contradiction penalty
+    contra_answer = "Outpatient low-risk pneumonia should not be treated with Amoxicillin or Doxycycline."
+    res_contra = validate_response_with_nli(contra_answer, evidence_chunks, embedder, cross_encoder=cross_encoder)
+    assert res_contra["grounding_level"] == "Not Supported"
+    assert res_contra["confidence_level"] == "Low"
+    assert res_contra["confidence_score"] <= 0.20
+
+    # 3. Unsupported answer with zero claims
+    unsupp_chunks = []
+    res_unsupp = validate_response_with_nli(answer, unsupp_chunks, embedder, cross_encoder=cross_encoder)
+    assert res_unsupp["confidence_level"] == "Low"
+    assert res_unsupp["confidence_score"] == 0.0
+

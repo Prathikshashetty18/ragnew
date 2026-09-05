@@ -362,37 +362,54 @@ def validate_response_with_nli(
                 
     total_claims = len(response_sentences)
     supported_claims = entailment_count
+    claim_coverage = (supported_claims / total_claims) if total_claims > 0 else 0.0
+    avg_claim_score = (total_score_sum / total_claims) if total_claims > 0 else 0.0
     
+    # Extract top 3 actual retrieval and rerank scores from context chunks
+    top3_chunks = context_chunks[:3] if context_chunks else []
+    top3_dense_list = [float(c["dense_score"]) if c.get("dense_score") is not None else float(avg_claim_score) for c in top3_chunks]
+    top3_rerank_list = [float(c["rerank_score"]) if c.get("rerank_score") is not None else float(avg_claim_score) for c in top3_chunks]
+    
+    mean_top3_dense = sum(top3_dense_list) / max(len(top3_dense_list), 1) if top3_dense_list else 0.0
+    mean_top3_rerank = sum(top3_rerank_list) / max(len(top3_rerank_list), 1) if top3_rerank_list else 0.0
+
     # Grounding Level Determination:
     # 🟢 Strongly Supported: All claims are directly supported by evidence
     # 🟡 Partially Supported: Some information supported, but verification needed
     # 🔴 Not Supported: Claim is not supported by retrieved evidence or contradiction found
-    if total_claims == 0:
+    if total_claims == 0 or contradiction_count > 0 or supported_claims == 0:
         grounding_level = "Not Supported"
-        confidence_level = "Low"
-    elif contradiction_count > 0:
-        grounding_level = "Not Supported"
-        confidence_level = "Low"
     elif supported_claims == total_claims and total_claims > 0:
         grounding_level = "Strongly Supported"
-        confidence_level = "High"
     elif supported_claims > 0 or (neutral_count > 0 and contradiction_count == 0):
         grounding_level = "Partially Supported"
-        confidence_level = "Medium"
     else:
         grounding_level = "Not Supported"
+
+    # Confidence Score Calculation (Design 2)
+    if total_claims == 0 or supported_claims == 0:
         confidence_level = "Low"
+        confidence_score = float(round(min((mean_top3_dense * 0.15) + (mean_top3_rerank * 0.15), 0.20), 2))
+    elif contradiction_count > 0:
+        confidence_level = "Low"
+        raw_conf = (avg_claim_score * claim_coverage * 0.70) + (mean_top3_dense * 0.15) + (mean_top3_rerank * 0.15)
+        confidence_score = float(round(min(raw_conf * 0.25, 0.20), 2))
+    else:
+        raw_conf = (avg_claim_score * claim_coverage * 0.70) + (mean_top3_dense * 0.15) + (mean_top3_rerank * 0.15)
+        confidence_score = float(round(raw_conf, 2))
         
+        if confidence_score >= 0.80 and supported_claims == total_claims:
+            confidence_level = "High"
+        elif confidence_score >= 0.50:
+            confidence_level = "Medium"
+        else:
+            confidence_level = "Low"
+
     grounding_coverage = f"{supported_claims} of {total_claims} claims supported"
     
-    avg_score = total_score_sum / max(total_claims, 1)
-    retrieval_avg = sum(c.get("retrieval_score", 0.7) for c in context_chunks) / max(len(context_chunks), 1)
-    confidence_score = float(round((avg_score * 0.7) + (retrieval_avg * 0.3), 2))
-    if contradiction_count > 0:
-        confidence_score = min(confidence_score * 0.3, 0.35)
-        
-    # Structured Backend Debug Logging for summary counts:
-    # entailment_count, neutral_count, contradiction_count, total_claims, confidence_score, confidence_level
+    # Structured Backend Debug Logging for diagnostic trace:
+    # avg_claim_score, claim_coverage, top3_dense_score, top3_rerank_score, final confidence_score
+    print(f"[CDSS CONFIDENCE] avg_claim_score: {avg_claim_score:.4f} | claim_coverage: {claim_coverage:.4f} ({supported_claims}/{total_claims}) | top3_dense_score: {mean_top3_dense:.4f} | top3_rerank_score: {mean_top3_rerank:.4f} | final confidence_score: {confidence_score:.2f} ({confidence_level})")
     print(f"entailment_count: {entailment_count} | neutral_count: {neutral_count} | contradiction_count: {contradiction_count} | total_claims: {total_claims} | confidence_score: {confidence_score} | confidence_level: {confidence_level}")
     print(f"grounding_level: {grounding_level} | coverage: {grounding_coverage}\n")
 

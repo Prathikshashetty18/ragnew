@@ -3,7 +3,7 @@ import uuid
 import hashlib
 import secrets
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from app.config import DATABASE_URL
 
@@ -108,8 +108,12 @@ class RadiologyReport(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     patient_id = Column(String(50), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
     recorded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    modality = Column(String(50), nullable=True, default="X-Ray")
     findings = Column(Text, nullable=True)
+    impression = Column(Text, nullable=True)
+    image_path = Column(String(512), nullable=True)
     document_id = Column(Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String(50), nullable=True, default="FINAL")
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     patient = relationship("Patient", back_populates="radiology_reports")
@@ -260,6 +264,25 @@ class ChatMessage(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    
+    # Ensure all columns exist in sqlite schema
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA table_info(radiology_reports)"))
+            existing_cols = {row[1] for row in result.fetchall()}
+            if existing_cols:
+                if "modality" not in existing_cols:
+                    conn.execute(text("ALTER TABLE radiology_reports ADD COLUMN modality VARCHAR(50)"))
+                if "impression" not in existing_cols:
+                    conn.execute(text("ALTER TABLE radiology_reports ADD COLUMN impression TEXT"))
+                if "image_path" not in existing_cols:
+                    conn.execute(text("ALTER TABLE radiology_reports ADD COLUMN image_path VARCHAR(512)"))
+                if "status" not in existing_cols:
+                    conn.execute(text("ALTER TABLE radiology_reports ADD COLUMN status VARCHAR(50)"))
+                conn.commit()
+    except Exception:
+        pass
+
     db = SessionLocal()
     try:
         # Seed users if admin is missing

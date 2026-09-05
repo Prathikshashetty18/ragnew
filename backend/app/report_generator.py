@@ -1,12 +1,14 @@
 import json
 import re
+import os
+import hashlib
 from datetime import datetime
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
 from app.database import Patient, PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, Document, User
-from app.rag_pipeline import query_pipeline, call_groq_llm, call_gemini_fallback
-from app.config import GROQ_API_KEY
+from app.rag_pipeline import query_pipeline, call_groq_llm, call_gemini_fallback, index_text_document, remove_document_from_vector_store
+from app.config import GROQ_API_KEY, UPLOAD_DIR
 
 def _to_clean_text(val: Any) -> str:
     """
@@ -193,6 +195,9 @@ Output ONLY valid JSON."""
         db.add(db_report)
         db.commit()
         db.refresh(db_report)
+        
+        # Sync generated report into Knowledge Base (FAISS + BM25)
+        sync_report_to_knowledge_base(db_report, doctor_user, db)
     except Exception as e:
         db.rollback()
         raise e
@@ -213,3 +218,137 @@ Output ONLY valid JSON."""
         "status": db_report.status,
         "created_at": db_report.created_at
     }
+
+
+def format_report_to_searchable_text(report: ClinicalReport, patient: Optional[Patient] = None) -> str:
+    """
+    Formats structured ClinicalReport fields into clean, human-readable markdown text
+    with standard section headers recognized by HierarchicalClinicalChunker.
+    """
+    p_name = patient.name if patient else "Unknown Patient"
+    p_age = patient.age if patient else "N/A"
+    p_gender = patient.gender if patient else "N/A"
+    p_dept = patient.department if patient else "General Medicine"
+    
+    sections = [
+        f"# CLINICAL PATIENT REPORT: {report.title}",
+        f"REPORT ID: {report.id} | STATUS: {report.status} | CREATED: {report.created_at.strftime('%Y-%m-%d %H:%M:%S') if report.created_at else 'N/A'}",
+        f"PATIENT ID: {report.patient_id} | PATIENT NAME: {p_name} | AGE: {p_age} | GENDER: {p_gender} | DEPARTMENT: {p_dept}",
+        "",
+        "## CHIEF COMPLAINT",
+        report.chief_complaint or "None stated",
+        "",
+        "## CLINICAL HISTORY",
+        report.clinical_history or "None recorded",
+        "",
+        "## OBSERVATIONS & VITALS",
+        report.observations or "None recorded",
+        "",
+        "## INVESTIGATIONS & LABS",
+        report.investigations or "None recorded",
+        "",
+        "## CLINICAL ASSESSMENT & DIAGNOSIS",
+        report.clinical_assessment or "None recorded",
+        "",
+        "## RELEVANT EVIDENCE & GUIDELINES",
+        report.relevant_evidence or "None cited",
+        "",
+        "## RECOMMENDATIONS & TREATMENT PLAN",
+        report.recommendations or "None recorded",
+        "",
+        "## SOURCES & REFERENCES",
+        report.sources or "None recorded"
+    ]
+    return "\n".join(sections)
+
+
+def sync_report_to_knowledge_base(report: ClinicalReport, user: Optional[User], db: Session) -> Optional[Document]:
+    """
+    Syncs a ClinicalReport to the Knowledge Base:
+    1. Formats report text into clean searchable clinical markdown.
+    2. Writes text file to UPLOAD_DIR.
+    3. Creates or updates a Document record in the database with scope='patient', approval_status='ACTIVE'.
+    4. If updating, removes old chunks from FAISS vector store and BM25 index.
+    5. Chunks, embeds, and indexes into FAISS and BM25 via index_text_document.
+    6. Updates Document chunk_count and commits.
+    """
+    try:
+        patient = db.query(Patient).filter(Patient.id == report.patient_id).first()
+        report_text = format_report_to_searchable_text(report, patient)
+        
+        doc_filename = f"Clinical_Report_{report.patient_id}_Report{report.id}.txt"
+        file_path = os.path.join(UPLOAD_DIR, doc_filename)
+        
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+            
+        file_hash = hashlib.md5(report_text.encode("utf-8")).hexdigest()
+        
+        # Check if Document record already exists
+        existing_doc = db.query(Document).filter(
+            (Document.name == doc_filename) | 
+            ((Document.patient_id == report.patient_id) & (Document.document_type == "clinical_report") & (Document.file_path == file_path))
+        ).first()
+        
+        if existing_doc:
+            # Remove previous chunks from FAISS and BM25
+            remove_document_from_vector_store(existing_doc.id)
+            existing_doc.file_path = file_path
+            existing_doc.hash_md5 = file_hash
+            existing_doc.status = "ready"
+            existing_doc.approval_status = "ACTIVE"
+            existing_doc.updated_at = datetime.utcnow()
+            
+            chunk_count = index_text_document(
+                text=report_text,
+                document_name=doc_filename,
+                doc_id=existing_doc.id,
+                scope="patient",
+                patient_id=report.patient_id,
+                version=existing_doc.version or "1.0",
+                document_type="clinical_report",
+                report_id=report.id
+            )
+            existing_doc.chunk_count = chunk_count
+            db.commit()
+            db.refresh(existing_doc)
+            print(f"Updated and re-indexed clinical report {report.id} (Doc ID {existing_doc.id}, {chunk_count} chunks).")
+            return existing_doc
+        else:
+            db_doc = Document(
+                name=doc_filename,
+                file_path=file_path,
+                status="ready",
+                approval_status="ACTIVE",
+                version="1.0",
+                medical_relevance_score=1.0,
+                hash_md5=file_hash,
+                chunk_count=0,
+                scope="patient",
+                patient_id=report.patient_id,
+                uploaded_by=user.id if user else None,
+                uploader_role=user.role if user else "DOCTOR",
+                document_type="clinical_report"
+            )
+            db.add(db_doc)
+            db.commit()
+            db.refresh(db_doc)
+            
+            chunk_count = index_text_document(
+                text=report_text,
+                document_name=doc_filename,
+                doc_id=db_doc.id,
+                scope="patient",
+                patient_id=report.patient_id,
+                version=db_doc.version,
+                document_type="clinical_report",
+                report_id=report.id
+            )
+            db_doc.chunk_count = chunk_count
+            db.commit()
+            db.refresh(db_doc)
+            print(f"Created and indexed clinical report {report.id} as Document {db_doc.id} ({chunk_count} chunks).")
+            return db_doc
+    except Exception as e:
+        print(f"Error syncing report {report.id} to Knowledge Base: {e}")
+        return None

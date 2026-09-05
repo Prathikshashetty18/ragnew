@@ -65,7 +65,7 @@ from app.router import MultiRAGRouter
 
 # Thread-safe locks
 _models_lock = threading.Lock()
-_vector_store_lock = threading.Lock()
+_vector_store_lock = threading.RLock()
 
 _embedding_model = None
 _faiss_index = None
@@ -245,6 +245,70 @@ def process_pdf(
     bm25.add_chunks(all_chunks)
 
     return len(all_chunks)
+
+
+def index_text_document(
+    text: str,
+    document_name: str,
+    doc_id: Optional[int] = None,
+    scope: str = "patient",
+    patient_id: Optional[str] = None,
+    version: str = "1.0",
+    document_type: str = "clinical_report",
+    report_id: Optional[int] = None
+) -> int:
+    """
+    Extracts structured blocks from text document, applies hierarchical chunking with structural context,
+    embeds contextualized chunks into FAISS, and updates the persistent BM25 index.
+    """
+    if not text or not text.strip():
+        return 0
+
+    chunker = HierarchicalClinicalChunker(chunk_size=RAG_CHUNK_SIZE, chunk_overlap=RAG_CHUNK_OVERLAP)
+    chunks = chunker.chunk_document(
+        text=text,
+        pdf_name=document_name,
+        page_number=1,
+        doc_id=doc_id,
+        scope=scope,
+        patient_id=patient_id,
+        version=version,
+        document_type=document_type
+    )
+
+    if not chunks:
+        return 0
+
+    if report_id:
+        for c in chunks:
+            c["report_id"] = report_id
+
+    embedder = get_embedding_model()
+    contextualized_texts = [chunk.get("contextualized_text") or chunk["text"] for chunk in chunks]
+
+    embeddings = embedder.encode(contextualized_texts, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype("float32")
+    faiss.normalize_L2(embeddings)
+
+    with _vector_store_lock:
+        index, metadata, embed_arr = get_vector_store()
+        index.add(embeddings)
+        metadata.extend(chunks)
+
+        global _embeddings_array
+        if _embeddings_array is None:
+            _embeddings_array = embeddings
+        else:
+            _embeddings_array = np.vstack([_embeddings_array, embeddings])
+
+        save_vector_store(index, metadata)
+
+    # Update persistent BM25 index
+    bm25 = get_bm25_index()
+    bm25.add_chunks(chunks)
+
+    print(f"Indexed text document '{document_name}' (doc_id={doc_id}, scope={scope}, patient={patient_id}): {len(chunks)} chunks.")
+    return len(chunks)
 
 
 DEFAULT_STRICT_RAG_SYSTEM_PROMPT = (
