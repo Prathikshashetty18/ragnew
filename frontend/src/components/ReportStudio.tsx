@@ -1,309 +1,279 @@
-import React, { useState, useEffect } from "react";
-import { Sparkles, CheckCircle2, Printer, AlertTriangle, ShieldCheck, Stethoscope, RefreshCw } from "lucide-react";
-import type { Patient, ClinicalReport, UserProfile } from "../types";
+import React, { useState } from "react";
+import { Sparkles, CheckCircle, Printer, Save } from "lucide-react";
+import type { Patient, ClinicalReport } from "../types";
 
 interface ReportStudioProps {
   patients: Patient[];
-  apiBase: string;
-  token: string;
-  currentUser: UserProfile;
-  initialPatientId?: string;
 }
 
-export const ReportStudio: React.FC<ReportStudioProps> = ({
-  patients,
-  apiBase,
-  token,
-  currentUser,
-  initialPatientId
-}) => {
-  const [selectedPatientId, setSelectedPatientId] = useState<string>(initialPatientId || (patients[0]?.id || ""));
-  const [chiefComplaint, setChiefComplaint] = useState("Productive cough, fever (38.2 C), and right pleuritic chest pain for 4 days.");
-  const [clinicalHistory, setClinicalHistory] = useState("No significant previous cardiopulmonary history. Presenting with acute respiratory distress.");
-  
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [activeReport, setActiveReport] = useState<ClinicalReport | null>(null);
-  
-  const [msg, setMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+export const ReportStudio: React.FC<ReportStudioProps> = ({ patients }) => {
+  const [selectedPatientId, setSelectedPatientId] = useState("");
+  const [chiefComplaint, setChiefComplaint] = useState("");
+  const [clinicalHistory, setClinicalHistory] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [currentReport, setCurrentReport] = useState<ClinicalReport | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (patients.length > 0 && !selectedPatientId) {
-      setSelectedPatientId(patients[0].id);
+  const handleGenerate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedPatientId || !chiefComplaint.trim()) {
+      alert("Please select a patient and enter chief complaint.");
+      return;
     }
-  }, [patients]);
 
-  const showNotification = (type: "success" | "error", text: string) => {
-    setMsg({ type, text });
-    setTimeout(() => setMsg(null), 4000);
-  };
+    setLoading(true);
+    setSuccessMsg(null);
 
-  const handleGenerateReport = async () => {
-    if (!selectedPatientId) return;
-    setIsGenerating(true);
     try {
-      const res = await fetch(`${apiBase}/api/reports/generate`, {
+      const res = await fetch("http://127.0.0.1:8000/api/reports/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
         },
         body: JSON.stringify({
           patient_id: selectedPatientId,
           chief_complaint: chiefComplaint,
-          clinical_history: clinicalHistory
-        })
+          clinical_history: clinicalHistory,
+        }),
       });
 
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
-        setActiveReport(data);
-        showNotification("success", "AI Patient Report generated! Review and verify below.");
+        setCurrentReport(data);
+        setSuccessMsg("AI draft report generated successfully. You can edit all fields below before approval.");
       } else {
-        const err = await res.json();
-        showNotification("error", err.detail || "Error generating report.");
+        alert(data.detail || "Report generation failed.");
       }
-    } catch (e) {
-      console.error(e);
-      showNotification("error", "Network error during report synthesis.");
+    } catch (err) {
+      alert("Error generating report.");
     } finally {
-      setIsGenerating(false);
+      setLoading(false);
     }
   };
 
-  const handleApproveReport = async () => {
-    if (!activeReport) return;
+  const handleSaveDraft = async () => {
+    if (!currentReport) return;
     try {
-      const res = await fetch(`${apiBase}/api/reports/${activeReport.id}/approve`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` }
+      const res = await fetch(`http://127.0.0.1:8000/api/reports/${currentReport.id}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+        body: JSON.stringify(currentReport),
       });
       if (res.ok) {
-        setActiveReport(prev => prev ? { ...prev, status: "APPROVED", approved_at: new Date().toISOString() } : null);
-        showNotification("success", "Report officially approved and committed to clinical record!");
+        setSuccessMsg("Draft report changes saved.");
       }
     } catch (e) {
-      console.error(e);
+      alert("Failed to save report.");
     }
   };
 
-  const selectedPatient = patients.find(p => p.id === selectedPatientId);
+  const handleApprove = async () => {
+    if (!currentReport) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/reports/${currentReport.id}/approve`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        setCurrentReport({ ...currentReport, status: "APPROVED" });
+        setSuccessMsg("Report officially APPROVED by Attending Physician and committed to patient records & RAG.");
+      }
+    } catch (e) {
+      alert("Failed to approve report.");
+    }
+  };
 
   return (
-    <div className="flex-1 h-full overflow-y-auto bg-slate-50 text-slate-800 p-6 md:p-8 space-y-6">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
+    <div className="flex-1 h-screen overflow-y-auto bg-slate-50 p-8">
+      <div className="max-w-5xl mx-auto space-y-6">
         <div>
-          <div className="flex items-center space-x-2 text-blue-600 text-xs font-bold uppercase tracking-wider mb-1">
-            <Stethoscope className="w-4 h-4" />
-            <span>Physician Decision Support</span>
+          <h1 className="text-xl font-bold text-slate-900 tracking-tight">Doctor AI Clinical Report Studio</h1>
+          <p className="text-xs text-slate-500">Synthesize patient longitudinal vitals, labs, radiology findings, and institutional guidelines into an editable official report.</p>
+        </div>
+
+        {successMsg && (
+          <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 font-semibold flex items-center gap-2">
+            <CheckCircle className="w-4 h-4 text-emerald-700" />
+            {successMsg}
           </div>
-          <h1 className="text-2xl font-black text-slate-900 tracking-tight">
-            AI Patient Clinical Report Studio
-          </h1>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Synthesize patient vitals, CBC labs, imaging findings, and clinical guidelines into structured draft reports.
-          </p>
-        </div>
+        )}
 
-        <div className="flex items-center space-x-2">
-          <span className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-bold flex items-center space-x-1.5">
-            <ShieldCheck className="w-3.5 h-3.5" />
-            <span>NLI Grounded & Doctor Approved</span>
-          </span>
-        </div>
-      </div>
-
-      {msg && (
-        <div className={`p-4 rounded-xl text-xs font-semibold flex items-center space-x-2 animate-fadeIn ${
-          msg.type === "success" ? "bg-emerald-50 border border-emerald-200 text-emerald-700" : "bg-red-50 border border-red-200 text-red-700"
-        }`}>
-          {msg.type === "success" ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
-          <span>{msg.text}</span>
-        </div>
-      )}
-
-      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-5">
-        <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider">
-          1. Select Patient & Enter Clinical Presentation
-        </h3>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-          <div>
-            <label className="block font-bold text-slate-700 mb-1.5">Select Patient</label>
-            <select
-              value={selectedPatientId}
-              onChange={(e) => setSelectedPatientId(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-xs font-bold text-slate-900 outline-none focus:border-blue-500"
-            >
-              {patients.map(p => (
-                <option key={p.id} value={p.id}>{p.id} - {p.name} ({p.department})</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="md:col-span-2">
-            <label className="block font-bold text-slate-700 mb-1.5">Chief Complaint</label>
-            <input
-              type="text"
-              value={chiefComplaint}
-              onChange={(e) => setChiefComplaint(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-xs outline-none focus:border-blue-500"
-            />
-          </div>
-        </div>
-
-        <div className="text-xs">
-          <label className="block font-bold text-slate-700 mb-1.5">Clinical History & Onset</label>
-          <textarea
-            rows={2}
-            value={clinicalHistory}
-            onChange={(e) => setClinicalHistory(e.target.value)}
-            className="w-full bg-slate-50 border border-slate-300 rounded-xl p-3 text-xs outline-none focus:border-blue-500"
-          />
-        </div>
-
-        <div className="flex items-center justify-between pt-2">
-          <span className="text-[11px] text-slate-500">
-            Pipeline: Patient Vitals + CBC Panel + Radiology + FAISS Guidelines &rarr; Llama 3.3 70B &rarr; Structured Draft
-          </span>
-
-          <button
-            type="button"
-            onClick={handleGenerateReport}
-            disabled={isGenerating}
-            className="flex items-center space-x-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-blue-500/20 cursor-pointer disabled:opacity-50"
-          >
-            {isGenerating ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>Synthesizing Report...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-4 h-4" />
-                <span>Generate AI Clinical Report</span>
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {activeReport && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-lg p-6 md:p-8 space-y-6 animate-fadeIn">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-200">
-            <div className="flex items-center space-x-3">
-              <span
-                className={`px-3 py-1 rounded-full text-xs font-extrabold tracking-wider uppercase flex items-center space-x-1.5 ${
-                  activeReport.status === "APPROVED"
-                    ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
-                    : "bg-amber-100 text-amber-900 border border-amber-300 animate-pulse"
-                }`}
-              >
-                <span>{activeReport.status}</span>
-              </span>
-
-              <span className="text-xs text-slate-400 font-medium">
-                Created {new Date(activeReport.created_at).toLocaleString()}
-              </span>
-            </div>
-
-            <div className="flex items-center space-x-3">
-              <button
-                onClick={() => window.print()}
-                className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-colors cursor-pointer"
-              >
-                <Printer className="w-3.5 h-3.5" />
-                <span>Print</span>
-              </button>
-
-              {activeReport.status !== "APPROVED" && currentUser.role === "DOCTOR" && (
-                <button
-                  onClick={handleApproveReport}
-                  className="flex items-center space-x-2 px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-emerald-500/20 cursor-pointer"
+        {/* Generator Form */}
+        <div className="p-6 bg-white rounded-2xl border border-slate-200 shadow-sm">
+          <form onSubmit={handleGenerate} className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Select Patient *</label>
+                <select
+                  required
+                  value={selectedPatientId}
+                  onChange={(e) => setSelectedPatientId(e.target.value)}
+                  className="w-full py-2.5 px-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
                 >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>Approve & Sign Official Report</span>
-                </button>
-              )}
-            </div>
-          </div>
+                  <option value="">-- Choose Patient --</option>
+                  {patients.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.id})
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-          {activeReport.status === "AI-GENERATED DRAFT" && (
-            <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start space-x-3">
-              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-              <div className="leading-relaxed">
-                <strong>Physician Notice:</strong> This clinical report was synthesized by AI decision support. It must be carefully reviewed, edited if necessary, and approved by the attending physician before becoming part of the official legal medical record.
-              </div>
-            </div>
-          )}
-
-          <div className="space-y-6 text-slate-900">
-            <div className="text-center space-y-1 pb-4 border-b border-slate-100">
-              <h2 className="text-xl font-black tracking-tight text-slate-900">
-                {activeReport.title}
-              </h2>
-              <p className="text-xs text-slate-500">
-                Department of {selectedPatient?.department || "Medicine"} • Hospital Clinical Decision System
-              </p>
-            </div>
-
-            <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-              <div>
-                <span className="font-bold text-slate-400 block text-[10px] uppercase">Patient ID</span>
-                <span className="font-mono font-bold text-blue-700">{selectedPatient?.id}</span>
-              </div>
-              <div>
-                <span className="font-bold text-slate-400 block text-[10px] uppercase">Full Name</span>
-                <span className="font-bold text-slate-800">{selectedPatient?.name}</span>
-              </div>
-              <div>
-                <span className="font-bold text-slate-400 block text-[10px] uppercase">Age / Gender</span>
-                <span className="font-semibold text-slate-800">{selectedPatient?.age} yrs • {selectedPatient?.gender}</span>
-              </div>
-              <div>
-                <span className="font-bold text-slate-400 block text-[10px] uppercase">Attending Physician</span>
-                <span className="font-bold text-slate-800">{currentUser.name}</span>
+              <div className="md:col-span-2">
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Chief Complaint *</label>
+                <input
+                  type="text"
+                  required
+                  value={chiefComplaint}
+                  onChange={(e) => setChiefComplaint(e.target.value)}
+                  placeholder="e.g. Acute onset of high fever, productive cough with purulent sputum, right-sided chest pain"
+                  className="w-full py-2.5 px-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="space-y-2 bg-slate-50/50 p-4 rounded-xl border border-slate-200/80">
-                <span className="text-xs font-black uppercase text-blue-800 tracking-wider">CHIEF COMPLAINT</span>
-                <p className="text-xs text-slate-700 leading-relaxed">{activeReport.chief_complaint}</p>
-              </div>
-
-              <div className="space-y-2 bg-slate-50/50 p-4 rounded-xl border border-slate-200/80">
-                <span className="text-xs font-black uppercase text-blue-800 tracking-wider">CLINICAL HISTORY</span>
-                <p className="text-xs text-slate-700 leading-relaxed">{activeReport.clinical_history}</p>
-              </div>
-
-              <div className="space-y-2 bg-slate-50/50 p-4 rounded-xl border border-slate-200/80">
-                <span className="text-xs font-black uppercase text-blue-800 tracking-wider">OBSERVATIONS & VITALS</span>
-                <p className="text-xs text-slate-700 leading-relaxed">{activeReport.observations}</p>
-              </div>
-
-              <div className="space-y-2 bg-slate-50/50 p-4 rounded-xl border border-slate-200/80">
-                <span className="text-xs font-black uppercase text-blue-800 tracking-wider">INVESTIGATIONS & LABS</span>
-                <p className="text-xs text-slate-700 leading-relaxed">{activeReport.investigations}</p>
-              </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Clinical History & Presentation</label>
+              <textarea
+                rows={2}
+                value={clinicalHistory}
+                onChange={(e) => setClinicalHistory(e.target.value)}
+                placeholder="e.g. Symptoms began 3 days ago. No previous respiratory admissions. Nonsmoker. Completed outpatient azithromycin with no resolution."
+                className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+              />
             </div>
 
-            <div className="space-y-2 bg-blue-50/30 p-5 rounded-xl border border-blue-200">
-              <span className="text-xs font-black uppercase text-blue-900 tracking-wider">CLINICAL ASSESSMENT & DIAGNOSIS</span>
-              <p className="text-xs text-slate-800 leading-relaxed font-medium">{activeReport.clinical_assessment}</p>
-            </div>
-
-            <div className="space-y-2 bg-emerald-50/30 p-5 rounded-xl border border-emerald-200">
-              <span className="text-xs font-black uppercase text-emerald-900 tracking-wider">RECOMMENDATIONS & MANAGEMENT PLAN</span>
-              <p className="text-xs text-slate-800 leading-relaxed whitespace-pre-wrap">{activeReport.recommendations}</p>
-            </div>
-
-            <div className="space-y-2 bg-slate-50 p-4 rounded-xl border border-slate-200 text-xs">
-              <span className="font-bold text-slate-500 uppercase tracking-wider block text-[10px]">CITED SOURCES & GUIDELINES</span>
-              <p className="text-slate-600 font-mono text-[11px]">{activeReport.sources}</p>
-            </div>
-          </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="py-3 px-6 bg-rose-900 hover:bg-rose-800 text-white rounded-xl text-xs font-semibold shadow-md flex items-center justify-center gap-2 transition disabled:opacity-50"
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>{loading ? "Synthesizing Evidence & Generating Draft..." : "Generate AI Patient Report Draft"}</span>
+            </button>
+          </form>
         </div>
-      )}
+
+        {/* Editable Report Workspace */}
+        {currentReport && (
+          <div className="p-8 bg-white rounded-2xl border border-slate-200 shadow-lg space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-200">
+              <div>
+                <input
+                  type="text"
+                  value={currentReport.title}
+                  onChange={(e) => setCurrentReport({ ...currentReport, title: e.target.value })}
+                  className="text-lg font-bold text-slate-900 w-full focus:outline-none focus:border-b-2 focus:border-rose-800"
+                />
+                <p className="text-xs text-slate-500 mt-1">Status: <strong className={currentReport.status === "APPROVED" ? "text-emerald-700" : "text-amber-700"}>{currentReport.status}</strong></p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSaveDraft}
+                  className="py-2 px-4 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-semibold flex items-center gap-1.5 transition"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  Save Draft
+                </button>
+                <button
+                  onClick={() => window.print()}
+                  className="py-2 px-4 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-semibold flex items-center gap-1.5 transition"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  Print
+                </button>
+                {currentReport.status !== "APPROVED" && (
+                  <button
+                    onClick={handleApprove}
+                    className="py-2 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold flex items-center gap-1.5 shadow-md transition"
+                  >
+                    <CheckCircle className="w-3.5 h-3.5" />
+                    Approve Official Report
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Editable Sections */}
+            <div className="space-y-4 text-xs">
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">1. Chief Complaint</label>
+                <textarea
+                  rows={2}
+                  value={currentReport.chief_complaint || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, chief_complaint: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">2. Clinical History</label>
+                <textarea
+                  rows={2}
+                  value={currentReport.clinical_history || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, clinical_history: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">3. Physical Observations & Vitals</label>
+                <textarea
+                  rows={2}
+                  value={currentReport.observations || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, observations: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">4. Diagnostic Investigations (Labs & Radiology)</label>
+                <textarea
+                  rows={2}
+                  value={currentReport.investigations || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, investigations: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">5. Clinical Assessment & Risk Stratification</label>
+                <textarea
+                  rows={3}
+                  value={currentReport.clinical_assessment || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, clinical_assessment: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">6. Evidence-Based Recommendations & Management Plan</label>
+                <textarea
+                  rows={4}
+                  value={currentReport.recommendations || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, recommendations: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">7. Hospital Guidelines & Citations Grounding</label>
+                <input
+                  type="text"
+                  value={currentReport.sources || ""}
+                  onChange={(e) => setCurrentReport({ ...currentReport, sources: e.target.value })}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800"
+                />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };

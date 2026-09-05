@@ -1,0 +1,23 @@
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded files
+uploads/
+
+# Generated test PDFs
+test_*.pdf
+
+# Generated RAG/vector store
+vector_store/*.pkl
+vector_store/*.npy
+vector_store/*.index

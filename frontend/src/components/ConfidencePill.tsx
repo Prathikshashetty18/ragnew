@@ -1,36 +1,56 @@
 import React from "react";
-import { ShieldCheck, AlertCircle, ShieldAlert } from "lucide-react";
 
-interface ConfidencePillProps {
-  level: "High" | "Medium" | "Low" | string;
-  score: number;
+export interface ConfidencePillProps {
+  level?: "High" | "Medium" | "Low" | string;
+  score?: number;
 }
 
-export const ConfidencePill: React.FC<ConfidencePillProps> = ({ level, score }) => {
-  const isHigh = level.toLowerCase() === "high";
-  const isMedium = level.toLowerCase() === "medium";
+export const ConfidencePill: React.FC<ConfidencePillProps> = ({ level = "High", score }) => {
+  const normLevel = (level || "High").trim();
+  const lower = normLevel.toLowerCase();
 
-  let bgClass = "bg-red-50 border-red-200 text-red-700 dark:bg-red-950/30 dark:border-red-900/50 dark:text-red-300";
-  let icon = <ShieldAlert className="w-3.5 h-3.5 mr-1 text-red-650 dark:text-red-405" />;
-  let tooltipText = "Warning: Contains unsupported statements or low context match.";
+  const isHigh = lower === "high" || lower.includes("strongly");
+  const isMed = lower === "medium" || lower === "med" || lower.includes("partially");
+
+  let badgeStyle = "bg-rose-50 border-rose-200 text-rose-800";
+  let dotColor = "bg-rose-500";
+  let displayLevel = "Low";
 
   if (isHigh) {
-    bgClass = "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950/30 dark:border-emerald-900/50 dark:text-emerald-300";
-    icon = <ShieldCheck className="w-3.5 h-3.5 mr-1 text-emerald-600 dark:text-emerald-400" />;
-    tooltipText = "Verified: All sentences match source clinical documents with high similarity.";
-  } else if (isMedium) {
-    bgClass = "bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950/30 dark:border-amber-900/50 dark:text-amber-300";
-    icon = <AlertCircle className="w-3.5 h-3.5 mr-1 text-amber-600 dark:text-amber-400" />;
-    tooltipText = "Caution: Clinical context matched, but verification scores are moderate.";
+    badgeStyle = "bg-emerald-50 border-emerald-200 text-emerald-800";
+    dotColor = "bg-emerald-500";
+    displayLevel = "High";
+  } else if (isMed) {
+    badgeStyle = "bg-amber-50 border-amber-200 text-amber-800";
+    dotColor = "bg-amber-500";
+    displayLevel = "Medium";
   }
 
+  // Convert 0-1 float to percentage by multiplying by 100
+  const scorePercent =
+    score !== undefined && score !== null
+      ? Math.round((typeof score === "number" ? score : parseFloat(score as any)) * 100)
+      : null;
+
   return (
-    <div
-      className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-bold border ${bgClass} select-none cursor-help transition-all duration-200`}
-      title={`${tooltipText} (Score: ${score})`}
-    >
-      {icon}
-      <span>{level} Confidence ({Math.round(score * 100)}%)</span>
+    <div className="inline-flex flex-wrap items-center gap-2">
+      {/* Confidence Level */}
+      <div
+        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border ${badgeStyle} select-none`}
+      >
+        <span className={`w-2 h-2 rounded-full ${dotColor}`} />
+        <span>Confidence Level: {displayLevel}</span>
+      </div>
+
+      {/* Confidence Score */}
+      {scorePercent !== null && !isNaN(scorePercent) && (
+        <div
+          className="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-100 border border-slate-200 text-slate-700 select-none"
+        >
+          <span>Confidence Score: {scorePercent}%</span>
+        </div>
+      )}
     </div>
   );
 };
+

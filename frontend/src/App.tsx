@@ -1,389 +1,297 @@
 import React, { useState, useEffect } from "react";
+import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { ChatArea } from "./components/ChatArea";
-import { Login } from "./components/Login";
 import { PatientDashboard } from "./components/PatientDashboard";
-import { DashboardHome } from "./components/DashboardHome";
-import { DocumentLibrary } from "./components/DocumentLibrary";
-import { KnowledgeBaseView } from "./components/KnowledgeBaseView";
 import { ReportStudio } from "./components/ReportStudio";
+import { RadiologyWorkspace } from "./components/RadiologyWorkspace";
+import { LaboratoryWorkspace } from "./components/LaboratoryWorkspace";
+import { KnowledgeBaseView } from "./components/KnowledgeBaseView";
+import { DocumentLibrary } from "./components/DocumentLibrary";
 import { UserManagement } from "./components/UserManagement";
 import { AuditLogView } from "./components/AuditLogView";
-import type { UserProfile, Patient, Document, Session, Message } from "./types";
-
-const API_BASE = "http://127.0.0.1:8000";
+import { DashboardHome } from "./components/DashboardHome";
+import type { User, Patient, ChatSession, ChatMessage } from "./types";
 
 export const App: React.FC = () => {
-  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
-    const saved = localStorage.getItem("cdss_user");
-    return saved ? JSON.parse(saved) : null;
-  });
-
-  const [token, setToken] = useState<string>(() => {
-    return localStorage.getItem("cdss_token") || "";
-  });
-
-  const [activeScreen, setActiveScreen] = useState<string>("dashboard");
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [activeView, setActiveView] = useState("dashboard");
   const [patients, setPatients] = useState<Patient[]>([]);
-  const [documents, setDocuments] = useState<Document[]>([]);
-  
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
-  const [inspectedSentence, setInspectedSentence] = useState<any | null>(null);
-  const [reportPatientId, setReportPatientId] = useState<string>("");
-  const [quickQuestion, setQuickQuestion] = useState<string>("");
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
 
-  const handleLoginSuccess = (user: UserProfile, accessToken: string) => {
+  useEffect(() => {
+    const token = localStorage.getItem("cdss_token");
+    if (token) {
+      fetch("http://127.0.0.1:8000/api/auth/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((u) => {
+          if (u) setCurrentUser(u);
+        })
+        .catch(() => {});
+    }
+  }, []);
+
+  const fetchPatients = async () => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/api/patients", {
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPatients(data);
+      }
+    } catch (e) {}
+  };
+
+  const fetchSessions = async () => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSessions(data);
+        if (!activeSessionId && data.length > 0) {
+          setActiveSessionId(data[0].id);
+          fetchMessages(data[0].id);
+        }
+      }
+    } catch (e) {}
+  };
+
+  const fetchMessages = async (sessionId: string) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/sessions/${sessionId}/messages`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(data);
+      }
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    if (currentUser) {
+      fetchPatients();
+      fetchSessions();
+    }
+  }, [currentUser]);
+
+  const handleLoginSuccess = (user: User, token: string) => {
+    localStorage.setItem("cdss_token", token);
     setCurrentUser(user);
-    setToken(accessToken);
-    localStorage.setItem("cdss_user", JSON.stringify(user));
-    localStorage.setItem("cdss_token", accessToken);
-    setActiveScreen("dashboard");
+    setActiveView("dashboard");
   };
 
   const handleLogout = () => {
-    setCurrentUser(null);
-    setToken("");
-    localStorage.removeItem("cdss_user");
     localStorage.removeItem("cdss_token");
+    setCurrentUser(null);
     setMessages([]);
-    setSessions([]);
     setActiveSessionId(null);
   };
 
-  const authHeaders = {
-    Authorization: `Bearer ${token}`
-  };
-
-  const fetchData = async () => {
-    if (!currentUser || !token) return;
-
+  const handleNewChat = async () => {
     try {
-      const pRes = await fetch(`${API_BASE}/api/patients`, { headers: authHeaders });
-      if (pRes.ok) {
-        const pData = await pRes.json();
-        setPatients(pData);
-      }
-
-      const dRes = await fetch(`${API_BASE}/api/documents`, { headers: authHeaders });
-      if (dRes.ok) {
-        const dData = await dRes.json();
-        setDocuments(dData);
-      }
-
-      const sRes = await fetch(`${API_BASE}/api/sessions`, { headers: authHeaders });
-      if (sRes.ok) {
-        const sData = await sRes.json();
-        setSessions(sData);
-        if (sData.length > 0 && !activeSessionId) {
-          setActiveSessionId(sData[0].id);
-        }
-      }
-    } catch (e) {
-      console.error("Error fetching hospital data:", e);
-    }
-  };
-
-  useEffect(() => {
-    if (currentUser && token) {
-      fetchData();
-    }
-  }, [currentUser, token]);
-
-  useEffect(() => {
-    if (!activeSessionId || !currentUser || !token) return;
-
-    const fetchSessionMessages = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/sessions/${activeSessionId}/messages`, {
-          headers: authHeaders
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setMessages(data);
-        }
-      } catch (e) {
-        console.error("Error fetching messages:", e);
-      }
-    };
-
-    fetchSessionMessages();
-  }, [activeSessionId, currentUser, token]);
-
-  const handleCreateSession = async () => {
-    if (!currentUser || !token) return;
-
-    try {
-      const res = await fetch(`${API_BASE}/api/sessions`, {
+      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...authHeaders
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
         },
-        body: JSON.stringify({ title: "New Consultation" })
+        body: JSON.stringify({ title: "New Chat" }),
       });
       if (res.ok) {
         const newSession = await res.json();
-        setSessions(prev => [newSession, ...prev]);
+        setSessions([newSession, ...sessions]);
         setActiveSessionId(newSession.id);
         setMessages([]);
+        setActiveView("chat");
       }
-    } catch (e) {
-      console.error("Error creating session:", e);
-    }
+    } catch (e) {}
   };
 
-  const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!currentUser || !token) return;
+  const handleSelectSession = (id: string) => {
+    setActiveSessionId(id);
+    fetchMessages(id);
+  };
 
+  const handleDeleteSession = async (id: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/sessions/${id}`, {
+      await fetch(`http://127.0.0.1:8000/api/sessions/${id}`, {
         method: "DELETE",
-        headers: authHeaders
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
-      if (res.ok) {
-        setSessions(prev => prev.filter(s => s.id !== id));
-        if (activeSessionId === id) {
-          const remaining = sessions.filter(s => s.id !== id);
-          if (remaining.length > 0) {
-            setActiveSessionId(remaining[0].id);
-          } else {
-            setActiveSessionId(null);
-            setMessages([]);
-          }
+      const updated = sessions.filter((s) => s.id !== id);
+      setSessions(updated);
+      if (activeSessionId === id) {
+        if (updated.length > 0) {
+          setActiveSessionId(updated[0].id);
+          fetchMessages(updated[0].id);
+        } else {
+          setActiveSessionId(null);
+          setMessages([]);
         }
       }
-    } catch (e) {
-      console.error("Error deleting session:", e);
-    }
+    } catch (e) {}
   };
 
-  const handleUploadFile = async (file: File, scope: string, patientId?: string, docType?: string) => {
-    if (!currentUser || !token) return;
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("scope", scope);
-    if (patientId) formData.append("patient_id", patientId);
-    if (docType) formData.append("document_type", docType);
-
-    const res = await fetch(`${API_BASE}/api/upload`, {
-      method: "POST",
-      headers: authHeaders,
-      body: formData
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      fetchData();
-      return data;
-    } else {
-      const err = await res.json();
-      throw new Error(err.detail || "Error uploading document.");
-    }
-  };
-
-  const handleSendMessage = async (text: string, filters: any, directLlm: boolean) => {
-    if (!currentUser || !token) return;
-
-    let targetSessionId = activeSessionId;
-    if (!targetSessionId) {
-      try {
-        const sRes = await fetch(`${API_BASE}/api/sessions`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...authHeaders
-          },
-          body: JSON.stringify({ title: text.slice(0, 30) })
-        });
-        if (sRes.ok) {
-          const sData = await sRes.json();
-          setSessions(prev => [sData, ...prev]);
-          setActiveSessionId(sData.id);
-          targetSessionId = sData.id;
-        }
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: "user",
-      content: text,
-      created_at: new Date().toISOString()
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setIsLoading(true);
-
-    try {
-      const res = await fetch(`${API_BASE}/api/ask`, {
+  const handleSendMessage = async (query: string, directLlm: boolean, attachedDocId?: number) => {
+    let currentSessionId = activeSessionId;
+    if (!currentSessionId) {
+      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...authHeaders
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+        body: JSON.stringify({ title: query.slice(0, 30) }),
+      });
+      const newSession = await res.json();
+      currentSessionId = newSession.id;
+      setSessions([newSession, ...sessions]);
+      setActiveSessionId(newSession.id);
+    }
+
+    const optimisticUserMsg: ChatMessage = {
+      id: `temp-${Date.now()}`,
+      role: "user",
+      content: query,
+    };
+    setMessages((prev) => [...prev, optimisticUserMsg]);
+    setIsLoading(true);
+
+    const filters: any = {};
+    if (attachedDocId) {
+      filters.scope = "temporary";
+      filters.document_id = attachedDocId;
+    } else if (selectedPatientId) {
+      filters.scope = "patient";
+      filters.patient_id = selectedPatientId;
+    } else {
+      filters.scope = "knowledge_base";
+    }
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/api/ask", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
         },
         body: JSON.stringify({
-          session_id: targetSessionId,
-          query: text,
-          filters: filters,
-          direct_llm: directLlm
-        })
+          session_id: currentSessionId,
+          query,
+          filters,
+          direct_llm: directLlm,
+        }),
       });
 
+      const data = await res.json();
       if (res.ok) {
-        const assistantMsg: Message = await res.json();
-        setMessages(prev => [...prev, assistantMsg]);
-        fetchData();
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: data.id,
+            role: "assistant",
+            content: data.content,
+            mode: data.mode,
+            confidence_level: data.confidence_level,
+            confidence_score: data.confidence_score,
+            sources: data.sources,
+            evidence: data.evidence,
+          },
+        ]);
+        fetchSessions();
       } else {
-        const err = await res.json();
-        alert(err.detail || "Error generating response.");
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: "assistant",
+            content: `Error: ${data.detail || "Clinical CDSS Query Failed"}`,
+            confidence_level: "Low",
+          },
+        ]);
       }
-    } catch (e) {
-      console.error(e);
-      alert("Network error: Failed to reach RAG server.");
+    } catch (err: any) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          role: "assistant",
+          content: "Unable to reach Clinical RAG service.",
+          confidence_level: "Low",
+        },
+      ]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleQuickAsk = (question: string) => {
-    setQuickQuestion(question);
-    setActiveScreen("clinical_ai");
+  const handleSelectPatientForChat = (patientId: string) => {
+    setSelectedPatientId(patientId);
+    setActiveView("chat");
   };
 
-  const handleSelectPatientForDashboard = (patientId: string) => {
-    setReportPatientId(patientId);
-    setActiveScreen("patients");
-  };
-
-  const handleAskAboutDoc = (doc: Document) => {
-    setQuickQuestion(`Summarize the clinical guidelines and recommendations in ${doc.name}`);
-    setActiveScreen("clinical_ai");
-    handleCreateSession();
-  };
-
-  const handleLaunchReport = (patientId: string) => {
-    setReportPatientId(patientId);
-    setActiveScreen("reports");
-  };
-
-  if (!currentUser || !token) {
-    return <Login onLoginSuccess={handleLoginSuccess} apiBase={API_BASE} />;
+  if (!currentUser) {
+    return <Login onLoginSuccess={handleLoginSuccess} />;
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-50 font-sans antialiased">
+    <div className="flex h-screen w-screen overflow-hidden font-sans antialiased text-slate-900 bg-slate-50">
       <Sidebar
+        currentUser={currentUser}
+        activeView={activeView}
+        setActiveView={setActiveView}
         sessions={sessions}
         activeSessionId={activeSessionId}
-        onSelectSession={setActiveSessionId}
-        onCreateSession={handleCreateSession}
+        onSelectSession={handleSelectSession}
+        onNewChat={handleNewChat}
         onDeleteSession={handleDeleteSession}
-        isOpen={isSidebarOpen}
-        onToggleOpen={() => setIsSidebarOpen(!isSidebarOpen)}
-        activeScreen={activeScreen}
-        onNavigate={setActiveScreen}
-        currentUser={currentUser}
         onLogout={handleLogout}
       />
 
-      <main className="flex-1 flex flex-col h-full overflow-hidden">
-        {activeScreen === "dashboard" && (
+      <main className="flex-1 flex overflow-hidden">
+        {activeView === "dashboard" && (
           <DashboardHome
             currentUser={currentUser}
             patients={patients}
-            documents={documents}
-            sessions={sessions}
-            onNavigate={(screen) => setActiveScreen(screen)}
-            onSelectPatient={handleSelectPatientForDashboard}
-            onSelectSession={setActiveSessionId}
-            onQuickAsk={handleQuickAsk}
+            setActiveView={setActiveView}
+            onSelectPatientForChat={handleSelectPatientForChat}
           />
         )}
-
-        {activeScreen === "clinical_ai" && (
+        {activeView === "chat" && (
           <ChatArea
             messages={messages}
-            activeSessionId={activeSessionId}
             onSendMessage={handleSendMessage}
             isLoading={isLoading}
-            isSidebarOpen={isSidebarOpen}
-            onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
-            onInspectSentence={setInspectedSentence}
-            activeInspectedSentence={inspectedSentence}
-            onUploadFile={handleUploadFile}
             patients={patients}
-            documents={documents}
-            initialQuery={quickQuestion}
+            selectedPatientId={selectedPatientId}
+            onSelectPatient={setSelectedPatientId}
           />
         )}
-
-        {activeScreen === "patients" && (
+        {activeView === "patients" && (
           <PatientDashboard
             patients={patients}
-            onSelectPatient={(id) => setReportPatientId(id)}
-            onLaunchConsultation={(_id, q) => {
-              if (q) setQuickQuestion(q);
-              setActiveScreen("clinical_ai");
-            }}
-            onLaunchReport={handleLaunchReport}
-            apiBase={API_BASE}
-            token={token}
             currentUser={currentUser}
-            onRefreshPatients={fetchData}
+            onSelectPatientForChat={handleSelectPatientForChat}
+            onRefreshPatients={fetchPatients}
           />
         )}
-
-        {activeScreen === "reports" && (
-          <ReportStudio
-            patients={patients}
-            apiBase={API_BASE}
-            token={token}
-            currentUser={currentUser}
-            initialPatientId={reportPatientId}
-          />
-        )}
-
-        {activeScreen === "knowledge_base" && (
-          <KnowledgeBaseView
-            documents={documents}
-            apiBase={API_BASE}
-            token={token}
-            currentUser={currentUser}
-            onRefreshDocuments={fetchData}
-            onUploadFile={handleUploadFile}
-          />
-        )}
-
-        {activeScreen === "documents" && (
-          <DocumentLibrary
-            documents={documents}
-            patients={patients}
-            onUploadFile={handleUploadFile}
-            onAskAboutDoc={handleAskAboutDoc}
-            isLoading={isLoading}
-          />
-        )}
-
-        {activeScreen === "users" && currentUser.role === "ADMIN" && (
-          <UserManagement
-            apiBase={API_BASE}
-            token={token}
-          />
-        )}
-
-        {activeScreen === "audit_logs" && currentUser.role === "ADMIN" && (
-          <AuditLogView
-            apiBase={API_BASE}
-            token={token}
-          />
-        )}
+        {activeView === "reports" && <ReportStudio patients={patients} />}
+        {activeView === "radiology" && <RadiologyWorkspace patients={patients} />}
+        {activeView === "laboratory" && <LaboratoryWorkspace patients={patients} />}
+        {activeView === "knowledge_base" && <KnowledgeBaseView currentUser={currentUser} />}
+        {activeView === "documents" && <DocumentLibrary currentUser={currentUser} />}
+        {activeView === "users" && <UserManagement />}
+        {activeView === "audit_logs" && <AuditLogView />}
       </main>
     </div>
   );

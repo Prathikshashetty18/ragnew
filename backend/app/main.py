@@ -713,6 +713,7 @@ def generate_report(req: ReportGenerateRequest, user: User = Depends(require_rol
         log_audit_event(db, user, "AI_REPORT_GENERATED", "clinical_report", str(report_data["id"]), "SUCCESS")
         return report_data
     except Exception as e:
+        db.rollback()
         log_audit_event(db, user, "AI_REPORT_GEN_FAILED", "patient", req.patient_id, "FAILURE", str(e))
         raise HTTPException(status_code=500, detail=f"Report generation error: {str(e)}")
 
@@ -1071,18 +1072,40 @@ def get_messages(session_id: str, user: User = Depends(get_current_user), db: Se
         raise HTTPException(status_code=403, detail="Unauthorized to view messages.")
         
     messages = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc()).all()
-    return [
-        {
+    formatted_messages = []
+    for m in messages:
+        v_results = m.verification_results or []
+        tot = len(v_results)
+        sup = sum(1 for v in v_results if v.get("status") == "Supported")
+        part = sum(1 for v in v_results if v.get("status") == "Partially Supported")
+        contra = sum(1 for v in v_results if v.get("status") == "Contradiction" or v.get("nli_label") == "Contradiction")
+        if tot == 0:
+            g_level = "Not Supported" if (m.confidence_level or "").lower() == "low" else "Partially Supported"
+        elif contra > 0:
+            g_level = "Not Supported"
+        elif sup == tot and tot > 0:
+            g_level = "Strongly Supported"
+        elif sup > 0 or part > 0:
+            g_level = "Partially Supported"
+        else:
+            g_level = "Not Supported"
+        cov = f"{sup} of {tot} claims supported" if tot > 0 else ""
+
+        formatted_messages.append({
             "id": m.id,
             "role": m.role,
             "content": m.content,
             "confidence_level": m.confidence_level,
             "confidence_score": m.confidence_score,
+            "grounding_level": g_level,
+            "grounding_coverage": cov,
+            "supported_claims": sup,
+            "total_claims": tot,
             "evidence": m.evidence,
             "verification_results": m.verification_results,
             "created_at": m.created_at
-        } for m in messages
-    ]
+        })
+    return formatted_messages
 
 @app.post("/api/ask")
 def ask_question(request: QueryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -1147,10 +1170,53 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         "content": assistant_msg.content,
         "confidence_level": assistant_msg.confidence_level,
         "confidence_score": assistant_msg.confidence_score,
+        "grounding_level": rag_result.get("grounding_level", "Partially Supported"),
+        "grounding_coverage": rag_result.get("grounding_coverage", ""),
+        "supported_claims": rag_result.get("supported_claims", 0),
+        "total_claims": rag_result.get("total_claims", 0),
         "evidence": assistant_msg.evidence,
         "verification_results": assistant_msg.verification_results,
         "created_at": assistant_msg.created_at,
-        "session_title": session.title
+        "session_title": session.title,
+        # Multi-RAG enhanced fields
+        "answer": assistant_msg.content,
+        "retrieval": rag_result.get("retrieval", {}),
+        "grounded": rag_result.get("grounded", True),
+        "citations": rag_result.get("citations", [])
+    }
+
+@app.post("/api/query")
+def direct_query_endpoint(request: QueryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Direct Multi-RAG clinical query endpoint."""
+    return ask_question(request, user, db)
+
+@app.get("/api/retrieval/metrics")
+def get_retrieval_metrics(user: User = Depends(get_current_user)):
+    """Exposes retrieval architecture configuration and index statistics."""
+    from app.config import (
+        RAG_DENSE_TOP_K, RAG_BM25_TOP_K, RAG_RRF_TOP_K, RAG_RRF_K,
+        RAG_RERANK_TOP_K, RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP,
+        RAG_ENABLE_QUERY_REWRITE, RAG_ENABLE_BM25, RAG_ENABLE_RERANKER
+    )
+    from app.rag_pipeline import get_vector_store, get_bm25_index
+    idx, meta, _ = get_vector_store()
+    bm25 = get_bm25_index()
+    return {
+        "vector_index_count": idx.ntotal if idx else 0,
+        "metadata_chunks_count": len(meta),
+        "bm25_doc_count": bm25.N if bm25 else 0,
+        "config": {
+            "dense_top_k": RAG_DENSE_TOP_K,
+            "bm25_top_k": RAG_BM25_TOP_K,
+            "rrf_top_k": RAG_RRF_TOP_K,
+            "rrf_k": RAG_RRF_K,
+            "rerank_top_k": RAG_RERANK_TOP_K,
+            "chunk_size": RAG_CHUNK_SIZE,
+            "chunk_overlap": RAG_CHUNK_OVERLAP,
+            "query_rewrite_enabled": RAG_ENABLE_QUERY_REWRITE,
+            "bm25_enabled": RAG_ENABLE_BM25,
+            "reranker_enabled": RAG_ENABLE_RERANKER
+        }
     }
 
 # ----------------- AUDIT LOGS (ADMIN ONLY) -----------------

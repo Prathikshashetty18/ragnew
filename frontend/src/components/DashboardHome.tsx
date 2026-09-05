@@ -1,323 +1,116 @@
-import React, { useState } from "react";
-import { 
-  Sparkles, ArrowRight, Upload, Users, BookOpen, Activity, 
-  CheckCircle, Clock, Stethoscope, ChevronRight,
-  TrendingUp, Database, FlaskConical, ShieldCheck
-} from "lucide-react";
-import type { Patient, Document, Session, UserProfile } from "../types";
+import React from "react";
+import { Activity, Users, BookOpen, ArrowRight, ShieldCheck } from "lucide-react";
+import type { User, Patient } from "../types";
 
 interface DashboardHomeProps {
-  currentUser: UserProfile;
+  currentUser: User;
   patients: Patient[];
-  documents: Document[];
-  sessions: Session[];
-  onNavigate: (screen: string) => void;
-  onSelectPatient: (patientId: string) => void;
-  onSelectSession: (sessionId: string) => void;
-  onQuickAsk: (question: string) => void;
+  setActiveView: (view: string) => void;
+  onSelectPatientForChat: (patientId: string) => void;
 }
 
 export const DashboardHome: React.FC<DashboardHomeProps> = ({
   currentUser,
   patients,
-  documents,
-  sessions,
-  onNavigate,
-  onSelectPatient,
-  onSelectSession,
-  onQuickAsk
+  setActiveView,
+  onSelectPatientForChat,
 }) => {
-  const [quickQuery, setQuickQuery] = useState("");
-
-  const handleQuickSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (quickQuery.trim()) {
-      onQuickAsk(quickQuery.trim());
-    }
-  };
-
-  const sampleQuickQuestions = [
-    "What is the empirical antibiotic therapy for outpatient pneumonia as per hospital guidelines?",
-    "What are the diagnostic criteria and workup required for suspected pulmonary tuberculosis?",
-    "What are the major acute complications of Type 2 Diabetes Mellitus?",
-    "Summarize vital signs and current clinical status for patient PAT-2026-000101."
-  ];
-
-  const kbDocs = documents.filter(d => d.scope === "knowledge_base" && d.approval_status === "ACTIVE");
-  const totalChunks = documents.reduce((acc, curr) => acc + (curr.chunk_count || 0), 0);
-
   return (
-    <div className="flex-1 h-full overflow-y-auto bg-slate-50 text-slate-800 p-6 md:p-8 space-y-8">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs">
-        <div className="space-y-1">
-          <div className="flex items-center space-x-2">
-            <span className="px-2.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-bold capitalize">
-              {currentUser.role} Workspace
-            </span>
-            <span className="text-xs text-slate-400">•</span>
-            <span className="text-xs text-slate-500 font-medium">{currentUser.department || "Internal Medicine"}</span>
+    <div className="flex-1 h-screen overflow-y-auto bg-slate-50 p-8">
+      <div className="max-w-6xl mx-auto space-y-6">
+        {/* Welcome Header */}
+        <div className="p-8 rounded-2xl bg-gradient-to-r from-rose-950 via-rose-900 to-rose-800 text-white shadow-lg relative overflow-hidden">
+          <div className="relative z-10">
+            <div className="flex items-center gap-2 mb-2 text-rose-200 text-xs font-semibold uppercase tracking-wider">
+              <ShieldCheck className="w-4 h-4" />
+              <span>Hospital Clinical Decision Support System</span>
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight">Welcome, {currentUser.name}</h1>
+            <p className="text-xs text-rose-100/80 mt-1 max-w-xl">
+              Role: <strong className="text-white uppercase">{currentUser.role}</strong> &bull; Department: <strong>{currentUser.department || "Clinical Services"}</strong>
+            </p>
           </div>
-          <h1 className="text-2xl md:text-3xl font-extrabold text-slate-900 tracking-tight">
-            Welcome back, {currentUser.name}
-          </h1>
-          <p className="text-sm text-slate-500">
-            RAG-powered clinical decision intelligence ready. {patients.length} patients and {kbDocs.length} hospital guidelines loaded.
-          </p>
         </div>
 
-        <div className="flex items-center space-x-3">
-          <button
-            onClick={() => onNavigate("clinical_ai")}
-            className="flex items-center space-x-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm shadow-blue-500/20 cursor-pointer"
+        {/* Quick Launch Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <div
+            onClick={() => setActiveView("chat")}
+            className="p-5 bg-white rounded-2xl border border-slate-200 shadow-sm hover:border-rose-300 hover:shadow-md transition cursor-pointer flex flex-col justify-between"
           >
-            <Sparkles className="w-4 h-4" />
-            <span>Consult Clinical AI</span>
-          </button>
-          <button
-            onClick={() => onNavigate("documents")}
-            className="flex items-center space-x-2 px-4 py-2.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-xs font-semibold transition-all cursor-pointer"
-          >
-            <Upload className="w-4 h-4 text-slate-500" />
-            <span>Upload Document</span>
-          </button>
-        </div>
-      </div>
-
-      <div className="bg-gradient-to-r from-blue-900 via-slate-900 to-blue-950 p-6 md:p-8 rounded-2xl text-white shadow-lg shadow-blue-950/20 border border-blue-800/40 relative overflow-hidden">
-        <div className="absolute top-0 right-0 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
-        
-        <div className="max-w-3xl space-y-4 relative z-10">
-          <div className="flex items-center space-x-2 text-blue-300 text-xs font-bold tracking-wider uppercase">
-            <Sparkles className="w-4 h-4 text-blue-400" />
-            <span>Ask Clinical Decision Support AI</span>
-          </div>
-          
-          <h2 className="text-xl md:text-2xl font-bold text-white tracking-tight">
-            Query across verified hospital clinical guidelines & patient charts
-          </h2>
-
-          <form onSubmit={handleQuickSubmit} className="relative">
-            <input
-              type="text"
-              placeholder="e.g. What is the first-line treatment for community-acquired pneumonia?"
-              value={quickQuery}
-              onChange={(e) => setQuickQuery(e.target.value)}
-              className="w-full bg-white/10 hover:bg-white/15 focus:bg-white text-slate-100 focus:text-slate-900 placeholder:text-slate-300 focus:placeholder:text-slate-400 border border-white/20 focus:border-blue-500 rounded-xl pl-4 pr-32 py-3.5 text-sm outline-none transition-all"
-            />
-            <button
-              type="submit"
-              disabled={!quickQuery.trim()}
-              className="absolute right-2 top-2 bottom-2 px-4 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all disabled:opacity-40 cursor-pointer"
-            >
-              <span>Ask AI</span>
+            <div>
+              <div className="w-10 h-10 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-900 mb-3">
+                <Activity className="w-5 h-5" />
+              </div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Clinical AI Consultation</h3>
+              <p className="text-xs text-slate-500">Query verified hospital guidelines, antimicrobial protocols, and patient timelines.</p>
+            </div>
+            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center text-xs font-semibold text-rose-900 gap-1">
+              <span>Start Consultation</span>
               <ArrowRight className="w-3.5 h-3.5" />
+            </div>
+          </div>
+
+          <div
+            onClick={() => setActiveView("patients")}
+            className="p-5 bg-white rounded-2xl border border-slate-200 shadow-sm hover:border-rose-300 hover:shadow-md transition cursor-pointer flex flex-col justify-between"
+          >
+            <div>
+              <div className="w-10 h-10 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-900 mb-3">
+                <Users className="w-5 h-5" />
+              </div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Patient Directory</h3>
+              <p className="text-xs text-slate-500">View admissions, vitals monitoring, CBC panels, and doctor assessments.</p>
+            </div>
+            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center text-xs font-semibold text-rose-900 gap-1">
+              <span>View {patients.length} Patients</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </div>
+          </div>
+
+          <div
+            onClick={() => setActiveView("knowledge_base")}
+            className="p-5 bg-white rounded-2xl border border-slate-200 shadow-sm hover:border-rose-300 hover:shadow-md transition cursor-pointer flex flex-col justify-between"
+          >
+            <div>
+              <div className="w-10 h-10 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-900 mb-3">
+                <BookOpen className="w-5 h-5" />
+              </div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Knowledge Base</h3>
+              <p className="text-xs text-slate-500">Hospital standard operating procedures, medical textbooks, and clinical policies.</p>
+            </div>
+            <div className="mt-4 pt-3 border-t border-slate-100 flex items-center text-xs font-semibold text-rose-900 gap-1">
+              <span>Explore Guidelines</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </div>
+          </div>
+        </div>
+
+        {/* Recent Inpatients */}
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-900 uppercase tracking-wider">Active Inpatients ({patients.length})</h2>
+            <button onClick={() => setActiveView("patients")} className="text-xs font-semibold text-rose-900 hover:underline">
+              View All
             </button>
-          </form>
-
-          <div className="flex flex-wrap items-center gap-2 pt-1">
-            <span className="text-[11px] text-slate-300 font-medium">Quick Prompts:</span>
-            {sampleQuickQuestions.map((q, idx) => (
-              <button
-                key={idx}
-                type="button"
-                onClick={() => onQuickAsk(q)}
-                className="text-[11px] bg-white/10 hover:bg-white/20 text-slate-200 border border-white/15 px-3 py-1 rounded-full transition-colors truncate max-w-xs cursor-pointer"
-              >
-                {q}
-              </button>
-            ))}
           </div>
-        </div>
-      </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-          <div className="space-y-1">
-            <span className="text-xs font-semibold text-slate-500">Accessible Patients</span>
-            <div className="text-2xl font-black text-slate-900">{patients.length}</div>
-            <span className="text-[11px] text-emerald-600 font-medium flex items-center">
-              <CheckCircle className="w-3 h-3 mr-1" /> Active in care
-            </span>
-          </div>
-          <div className="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center text-blue-600">
-            <Users className="w-6 h-6" />
-          </div>
-        </div>
-
-        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-          <div className="space-y-1">
-            <span className="text-xs font-semibold text-slate-500">Indexed Guidelines</span>
-            <div className="text-2xl font-black text-slate-900">{kbDocs.length}</div>
-            <span className="text-[11px] text-blue-600 font-medium">Hospital Knowledge Base</span>
-          </div>
-          <div className="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
-            <BookOpen className="w-6 h-6" />
-          </div>
-        </div>
-
-        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-          <div className="space-y-1">
-            <span className="text-xs font-semibold text-slate-500">Total Indexed Chunks</span>
-            <div className="text-2xl font-black text-slate-900">{totalChunks}</div>
-            <span className="text-[11px] text-slate-500 font-medium">FAISS 384-d Vectors</span>
-          </div>
-          <div className="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-purple-600">
-            <Database className="w-6 h-6" />
-          </div>
-        </div>
-
-        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-          <div className="space-y-1">
-            <span className="text-xs font-semibold text-slate-500">Grounding Confidence</span>
-            <div className="text-2xl font-black text-slate-900">95.4%</div>
-            <span className="text-[11px] text-emerald-600 font-medium flex items-center">
-              <TrendingUp className="w-3 h-3 mr-1" /> NLI Verified
-            </span>
-          </div>
-          <div className="w-12 h-12 bg-amber-50 rounded-xl flex items-center justify-center text-amber-600">
-            <ShieldCheck className="w-6 h-6" />
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div className="lg:col-span-2 space-y-6">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-base font-bold text-slate-900">Assigned Patient Profiles</h3>
-                <p className="text-xs text-slate-500">Patients under active monitoring</p>
-              </div>
-              <button
-                onClick={() => onNavigate("patients")}
-                className="text-xs font-bold text-blue-600 hover:text-blue-700 flex items-center cursor-pointer"
-              >
-                <span>View All Patients</span>
-                <ChevronRight className="w-4 h-4 ml-0.5" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-              {patients.map((patient) => (
-                <div
-                  key={patient.id}
-                  onClick={() => onSelectPatient(patient.id)}
-                  className="p-4 bg-slate-50 hover:bg-blue-50/50 border border-slate-200 hover:border-blue-300 rounded-xl transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-xs font-bold text-blue-700 bg-blue-100/60 px-2 py-0.5 rounded">
-                      {patient.id}
-                    </span>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                      patient.status === "ACTIVE" ? "bg-emerald-100 text-emerald-800" :
-                      patient.status === "DISCHARGED" ? "bg-slate-200 text-slate-800" :
-                      "bg-amber-100 text-amber-800"
-                    }`}>
-                      {patient.status}
-                    </span>
-                  </div>
-
-                  <div className="mt-2.5">
-                    <div className="text-sm font-bold text-slate-900 group-hover:text-blue-600 transition-colors">
-                      {patient.name}
-                    </div>
-                    <div className="text-xs text-slate-500 mt-0.5">
-                      {patient.age} yrs • {patient.gender} • Dept: {patient.department}
-                    </div>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
-                    <span className="flex items-center space-x-1">
-                      <Activity className="w-3.5 h-3.5 text-blue-500" />
-                      <span>Doctor: {patient.assigned_doctor || "Staff"}</span>
-                    </span>
-                    <span className="font-semibold text-blue-600 group-hover:underline">Open Chart &rarr;</span>
-                  </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {patients.slice(0, 4).map((p) => (
+              <div key={p.id} className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-col justify-between">
+                <div>
+                  <h4 className="text-xs font-bold text-slate-900">{p.name}</h4>
+                  <p className="text-[10px] text-slate-500 font-mono">{p.id} &bull; {p.department}</p>
+                  <p className="text-xs text-slate-700 mt-2 font-medium">Status: {p.health_status}</p>
                 </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
-            <h3 className="text-base font-bold text-slate-900">Clinical Workflow Shortcuts</h3>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <button
-                onClick={() => onNavigate("clinical_ai")}
-                className="p-3.5 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl text-left transition-all cursor-pointer"
-              >
-                <Stethoscope className="w-5 h-5 text-blue-600 mb-2" />
-                <div className="text-xs font-bold text-slate-800">New Consultation</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Start AI query</div>
-              </button>
-
-              <button
-                onClick={() => onNavigate("documents")}
-                className="p-3.5 bg-slate-50 hover:bg-teal-50 border border-slate-200 hover:border-teal-300 rounded-xl text-left transition-all cursor-pointer"
-              >
-                <Upload className="w-5 h-5 text-teal-600 mb-2" />
-                <div className="text-xs font-bold text-slate-800">Upload PDF</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Vector index</div>
-              </button>
-
-              <button
-                onClick={() => onNavigate("patients")}
-                className="p-3.5 bg-slate-50 hover:bg-purple-50 border border-slate-200 hover:border-purple-300 rounded-xl text-left transition-all cursor-pointer"
-              >
-                <Activity className="w-5 h-5 text-purple-600 mb-2" />
-                <div className="text-xs font-bold text-slate-800">Record Vitals</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Nurse triage</div>
-              </button>
-
-              <button
-                onClick={() => onNavigate("knowledge_base")}
-                className="p-3.5 bg-slate-50 hover:bg-amber-50 border border-slate-200 hover:border-amber-300 rounded-xl text-left transition-all cursor-pointer"
-              >
-                <FlaskConical className="w-5 h-5 text-amber-600 mb-2" />
-                <div className="text-xs font-bold text-slate-800">Guidelines Base</div>
-                <div className="text-[10px] text-slate-500 mt-0.5">FAISS Vectors</div>
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-6">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900">Recent Consultations</h3>
-              <button
-                onClick={() => onNavigate("clinical_ai")}
-                className="text-xs font-semibold text-blue-600 hover:underline cursor-pointer"
-              >
-                All
-              </button>
-            </div>
-
-            {sessions.length === 0 ? (
-              <div className="text-center py-6 text-xs text-slate-400">
-                No recent consultations found.
+                <button
+                  onClick={() => onSelectPatientForChat(p.id)}
+                  className="mt-3 w-full py-1.5 bg-rose-900 hover:bg-rose-800 text-white rounded-lg text-xs font-semibold transition"
+                >
+                  Consult AI
+                </button>
               </div>
-            ) : (
-              <div className="space-y-2.5">
-                {sessions.slice(0, 4).map((session) => (
-                  <div
-                    key={session.id}
-                    onClick={() => {
-                      onSelectSession(session.id);
-                      onNavigate("clinical_ai");
-                    }}
-                    className="p-3 bg-slate-50 hover:bg-blue-50/70 border border-slate-200 hover:border-blue-200 rounded-xl transition-all cursor-pointer"
-                  >
-                    <div className="text-xs font-bold text-slate-800 truncate">
-                      {session.title || "Clinical AI Query"}
-                    </div>
-                    <div className="flex items-center space-x-1 text-[10px] text-slate-400 mt-1">
-                      <Clock className="w-3 h-3" />
-                      <span>{new Date(session.created_at).toLocaleDateString()}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+            ))}
           </div>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
@@ -6,6 +7,27 @@ from sqlalchemy.orm import Session
 from app.database import Patient, PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, Document, User
 from app.rag_pipeline import query_pipeline, call_groq_llm, call_gemini_fallback
 from app.config import GROQ_API_KEY
+
+def _to_clean_text(val: Any) -> str:
+    """
+    Safely converts a field that may be returned by the LLM as a list, dict,
+    or other non-string type into an appropriate string for SQLite Text columns.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, list):
+        items = []
+        for item in val:
+            if isinstance(item, (dict, list)):
+                items.append(json.dumps(item))
+            elif item is not None:
+                items.append(str(item).strip())
+        return "\n".join(items)
+    if isinstance(val, dict):
+        return json.dumps(val, indent=2)
+    return str(val).strip()
 
 def build_patient_context_summary(patient_id: str, db: Session) -> Dict[str, Any]:
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
@@ -121,7 +143,7 @@ Output ONLY valid JSON."""
     report_data = None
     if GROQ_API_KEY:
         try:
-            raw_response = call_groq_llm(prompt)
+            raw_response = call_groq_llm(prompt, max_tokens=4096)
             # Extract JSON
             json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
             if json_match:
@@ -143,25 +165,37 @@ Output ONLY valid JSON."""
             "sources": "Hospital Clinical Practice Guidelines, Patient Lab Panel, Radiology Report"
         }
         
+    # Convert list/dict fields from LLM (such as recommendations, sources, relevant_evidence) to strings before saving
+    if isinstance(report_data, dict):
+        for field in ["title", "chief_complaint", "clinical_history", "observations", 
+                      "investigations", "clinical_assessment", "relevant_evidence", 
+                      "recommendations", "sources"]:
+            if field in report_data:
+                report_data[field] = _to_clean_text(report_data[field])
+
     # Create DB entry for draft report
     db_report = ClinicalReport(
         patient_id=patient_id,
         doctor_id=doctor_user.id,
-        title=report_data.get("title", f"Clinical Report: {patient.name}"),
-        chief_complaint=report_data.get("chief_complaint", chief_complaint),
-        clinical_history=report_data.get("clinical_history", clinical_history),
-        observations=report_data.get("observations", ""),
-        investigations=report_data.get("investigations", ""),
-        clinical_assessment=report_data.get("clinical_assessment", ""),
-        relevant_evidence=report_data.get("relevant_evidence", ""),
-        recommendations=report_data.get("recommendations", ""),
-        sources=report_data.get("sources", ""),
+        title=_to_clean_text(report_data.get("title")) or f"Clinical Report: {patient.name}",
+        chief_complaint=_to_clean_text(report_data.get("chief_complaint")) or chief_complaint,
+        clinical_history=_to_clean_text(report_data.get("clinical_history")) or clinical_history,
+        observations=_to_clean_text(report_data.get("observations")),
+        investigations=_to_clean_text(report_data.get("investigations")),
+        clinical_assessment=_to_clean_text(report_data.get("clinical_assessment")),
+        relevant_evidence=_to_clean_text(report_data.get("relevant_evidence")),
+        recommendations=_to_clean_text(report_data.get("recommendations")),
+        sources=_to_clean_text(report_data.get("sources")),
         status="AI-GENERATED DRAFT",
         created_at=datetime.utcnow()
     )
-    db.add(db_report)
-    db.commit()
-    db.refresh(db_report)
+    try:
+        db.add(db_report)
+        db.commit()
+        db.refresh(db_report)
+    except Exception as e:
+        db.rollback()
+        raise e
     
     return {
         "id": db_report.id,
