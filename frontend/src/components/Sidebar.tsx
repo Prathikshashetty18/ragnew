@@ -1,7 +1,7 @@
 import React from "react";
 import {
   Activity, Plus, MessageSquare, Users, FileText, Image as ImageIcon,
-  TestTube, BookOpen, FolderArchive, Shield, Key, LogOut, Trash2
+  TestTube, BookOpen, Shield, Key, LogOut, Trash2
 } from "lucide-react";
 import type { User, ChatSession } from "../types";
 
@@ -38,7 +38,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: "radiology", label: "Radiology", icon: ImageIcon, roles: ["ADMIN", "DOCTOR", "INTERN", "RADIOLOGIST"] },
     { id: "laboratory", label: "Laboratory", icon: TestTube, roles: ["ADMIN", "DOCTOR", "INTERN", "LABORATORY_TECHNICIAN"] },
     { id: "knowledge_base", label: "Knowledge Base", icon: BookOpen, roles: ["ADMIN", "DOCTOR", "INTERN", "NURSE", "RADIOLOGIST", "LABORATORY_TECHNICIAN", "FRONT_DESK", "OTHER_STAFF"] },
-    { id: "documents", label: "Documents", icon: FolderArchive, roles: ["ADMIN", "DOCTOR", "INTERN", "NURSE", "RADIOLOGIST", "LABORATORY_TECHNICIAN", "OTHER_STAFF"] },
     { id: "users", label: "Staff Management", icon: Key, roles: ["ADMIN"] },
     { id: "audit_logs", label: "Compliance Audit", icon: Shield, roles: ["ADMIN"] },
   ];

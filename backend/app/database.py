@@ -78,8 +78,12 @@ class PatientVitals(Base):
     recorded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     blood_pressure = Column(String(50), nullable=True)
     pulse = Column(Integer, nullable=True)
+    respiratory_rate = Column(Integer, nullable=True)
     temperature = Column(Float, nullable=True)
     spo2 = Column(Integer, nullable=True)
+    blood_glucose = Column(Float, nullable=True)
+    pain_score = Column(Integer, nullable=True)
+    intake_output = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -280,106 +284,167 @@ def init_db():
                 if "status" not in existing_cols:
                     conn.execute(text("ALTER TABLE radiology_reports ADD COLUMN status VARCHAR(50)"))
                 conn.commit()
+
+            result_vitals = conn.execute(text("PRAGMA table_info(patient_vitals)"))
+            vitals_cols = {row[1] for row in result_vitals.fetchall()}
+            if vitals_cols:
+                if "respiratory_rate" not in vitals_cols:
+                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN respiratory_rate INTEGER"))
+                if "blood_glucose" not in vitals_cols:
+                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN blood_glucose FLOAT"))
+                if "pain_score" not in vitals_cols:
+                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN pain_score INTEGER"))
+                if "intake_output" not in vitals_cols:
+                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN intake_output VARCHAR(255)"))
+                conn.commit()
     except Exception:
         pass
 
     db = SessionLocal()
     try:
-        # Seed users if admin is missing
-        if db.query(User).filter(User.username == "admin").count() == 0:
-            print("Seeding database with Hospital Admin and Professional Staff accounts...")
-            users = [
-                User(
-                    username="admin",
-                    password_hash=hash_pw_seed("Admin@123"),
-                    role="ADMIN",
-                    name="Hospital Administrator",
-                    email="admin@hospital.org",
-                    employee_id="EMP-ADM-001",
-                    department="Administration",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="arun",
-                    password_hash=hash_pw_seed("Doctor@123"),
-                    role="DOCTOR",
-                    name="Dr. Arun",
-                    email="arun@hospital.org",
-                    employee_id="EMP-DOC-101",
-                    department="Internal Medicine",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="meera",
-                    password_hash=hash_pw_seed("Doctor@123"),
-                    role="DOCTOR",
-                    name="Dr. Meera",
-                    email="meera@hospital.org",
-                    employee_id="EMP-DOC-102",
-                    department="Cardiology",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="frontdesk",
-                    password_hash=hash_pw_seed("Front@123"),
-                    role="FRONT_DESK",
-                    name="Sarah (Front Desk)",
-                    email="frontdesk@hospital.org",
-                    employee_id="EMP-FD-201",
-                    department="Patient Registration",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="priya",
-                    password_hash=hash_pw_seed("Nurse@123"),
-                    role="NURSE",
-                    name="Priya (Staff Nurse)",
-                    email="priya@hospital.org",
-                    employee_id="EMP-NUR-301",
-                    department="Inpatient Ward",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="arjun_intern",
-                    password_hash=hash_pw_seed("Intern@123"),
-                    role="INTERN",
-                    name="Arjun (Resident Intern)",
-                    email="arjun@hospital.org",
-                    employee_id="EMP-INT-601",
-                    department="Internal Medicine",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="rahul_rad",
-                    password_hash=hash_pw_seed("Staff@123"),
-                    role="OTHER_STAFF",
-                    name="Rahul (Radiologist)",
-                    email="rahul@hospital.org",
-                    employee_id="EMP-RAD-401",
-                    department="Radiology",
-                    status="ACTIVE"
-                ),
-                User(
-                    username="ananya_lab",
-                    password_hash=hash_pw_seed("Staff@123"),
-                    role="OTHER_STAFF",
-                    name="Ananya (Lab Tech)",
-                    email="ananya@hospital.org",
-                    employee_id="EMP-LAB-501",
-                    department="Pathology",
-                    status="ACTIVE"
-                ),
-            ]
-            for u in users:
-                existing = db.query(User).filter(User.username == u.username).first()
-                if not existing:
-                    db.add(u)
-                else:
-                    # Update password hash and status if needed
+        # Seed users if missing
+        users = [
+            User(
+                username="admin",
+                password_hash=hash_pw_seed("Admin@123"),
+                role="ADMIN",
+                name="Hospital Administrator",
+                email="admin@hospital.org",
+                employee_id="EMP-ADM-001",
+                department="Administration",
+                status="ACTIVE"
+            ),
+            User(
+                username="reshma",
+                password_hash=hash_pw_seed("reshma@123"),
+                role="DOCTOR",
+                name="Dr. Reshma",
+                email="reshma@hospital.org",
+                employee_id="EMP-DOC-103",
+                department="Internal Medicine",
+                status="ACTIVE"
+            ),
+            User(
+                username="prakash_rad",
+                password_hash=hash_pw_seed("Radio@123"),
+                role="RADIOLOGIST",
+                name="Dr. Prakash (Radiology)",
+                email="prakash@hospital.org",
+                employee_id="EMP-RAD-402",
+                department="Radiology",
+                status="ACTIVE"
+            ),
+            User(
+                username="rakshith",
+                password_hash=hash_pw_seed("rakshith@123"),
+                role="LABORATORY_TECHNICIAN",
+                name="Rakshith (Lab Tech)",
+                email="rakshith@hospital.org",
+                employee_id="EMP-LAB-502",
+                department="Pathology",
+                status="ACTIVE"
+            ),
+            User(
+                username="riya",
+                password_hash=hash_pw_seed("riya@123"),
+                role="NURSE",
+                name="Riya (Staff Nurse)",
+                email="riya@hospital.org",
+                employee_id="EMP-NUR-302",
+                department="Inpatient Ward",
+                status="ACTIVE"
+            ),
+            User(
+                username="shreya",
+                password_hash=hash_pw_seed("shreya@123"),
+                role="FRONT_DESK",
+                name="Shreya (Front Desk)",
+                email="shreya@hospital.org",
+                employee_id="EMP-FD-202",
+                department="Patient Registration",
+                status="ACTIVE"
+            ),
+            User(
+                username="arun",
+                password_hash=hash_pw_seed("Doctor@123"),
+                role="DOCTOR",
+                name="Dr. Arun",
+                email="arun@hospital.org",
+                employee_id="EMP-DOC-101",
+                department="Internal Medicine",
+                status="ACTIVE"
+            ),
+            User(
+                username="meera",
+                password_hash=hash_pw_seed("Doctor@123"),
+                role="DOCTOR",
+                name="Dr. Meera",
+                email="meera@hospital.org",
+                employee_id="EMP-DOC-102",
+                department="Cardiology",
+                status="ACTIVE"
+            ),
+            User(
+                username="frontdesk",
+                password_hash=hash_pw_seed("Front@123"),
+                role="FRONT_DESK",
+                name="Sarah (Front Desk)",
+                email="frontdesk@hospital.org",
+                employee_id="EMP-FD-201",
+                department="Patient Registration",
+                status="ACTIVE"
+            ),
+            User(
+                username="priya",
+                password_hash=hash_pw_seed("Nurse@123"),
+                role="NURSE",
+                name="Priya (Staff Nurse)",
+                email="priya@hospital.org",
+                employee_id="EMP-NUR-301",
+                department="Inpatient Ward",
+                status="ACTIVE"
+            ),
+            User(
+                username="arjun_intern",
+                password_hash=hash_pw_seed("Intern@123"),
+                role="INTERN",
+                name="Arjun (Resident Intern)",
+                email="arjun@hospital.org",
+                employee_id="EMP-INT-601",
+                department="Internal Medicine",
+                status="ACTIVE"
+            ),
+            User(
+                username="rahul_rad",
+                password_hash=hash_pw_seed("Staff@123"),
+                role="OTHER_STAFF",
+                name="Rahul (Radiologist)",
+                email="rahul@hospital.org",
+                employee_id="EMP-RAD-401",
+                department="Radiology",
+                status="ACTIVE"
+            ),
+            User(
+                username="ananya_lab",
+                password_hash=hash_pw_seed("Staff@123"),
+                role="OTHER_STAFF",
+                name="Ananya (Lab Tech)",
+                email="ananya@hospital.org",
+                employee_id="EMP-LAB-501",
+                department="Pathology",
+                status="ACTIVE"
+            ),
+        ]
+        for u in users:
+            existing = db.query(User).filter(User.username == u.username).first()
+            if not existing:
+                db.add(u)
+            else:
+                if u.username != "admin":
                     existing.password_hash = u.password_hash
                     existing.role = u.role
                     existing.status = u.status
-            db.commit()
+        db.commit()
 
         # Seed Trusted Sources
         if db.query(TrustedSource).count() == 0:

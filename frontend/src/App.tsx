@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { ChatArea } from "./components/ChatArea";
@@ -7,11 +7,10 @@ import { ReportStudio } from "./components/ReportStudio";
 import { RadiologyWorkspace } from "./components/RadiologyWorkspace";
 import { LaboratoryWorkspace } from "./components/LaboratoryWorkspace";
 import { KnowledgeBaseView } from "./components/KnowledgeBaseView";
-import { DocumentLibrary } from "./components/DocumentLibrary";
 import { UserManagement } from "./components/UserManagement";
 import { AuditLogView } from "./components/AuditLogView";
 import { DashboardHome } from "./components/DashboardHome";
-import type { User, Patient, ChatSession, ChatMessage } from "./types";
+import type { User, Patient, ChatSession, ChatMessage, SourceCard } from "./types";
 
 export const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -22,6 +21,7 @@ export const App: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const token = localStorage.getItem("cdss_token");
@@ -72,7 +72,27 @@ export const App: React.FC = () => {
       });
       if (res.ok) {
         const data = await res.json();
-        setMessages(data);
+        const formatted = data.map((m: any) => {
+          let sources = m.sources;
+          if (!sources || sources.length === 0) {
+            if (m.evidence && Array.isArray(m.evidence) && m.evidence.length > 0) {
+              sources = m.evidence.map((ev: any, idx: number) => ({
+                document_id: String(ev.chunk_id || idx + 1),
+                citation_id: idx + 1,
+                title: ev.source || ev.title || "Clinical Document",
+                page: ev.page || 1,
+                section: ev.section || "Clinical Finding",
+                relevance: 0.85,
+                supporting_text: ev.supporting_text || ""
+              }));
+            }
+          }
+          return {
+            ...m,
+            sources: sources || []
+          };
+        });
+        setMessages(formatted);
       }
     } catch (e) {}
   };
@@ -178,9 +198,13 @@ export const App: React.FC = () => {
       filters.scope = "knowledge_base";
     }
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const res = await fetch("http://127.0.0.1:8000/api/ask", {
         method: "POST",
+        signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -195,16 +219,47 @@ export const App: React.FC = () => {
 
       const data = await res.json();
       if (res.ok) {
+        const mappedSources: SourceCard[] = [];
+        if (data.citations && Array.isArray(data.citations) && data.citations.length > 0) {
+          data.citations.forEach((c: any) => {
+            const evMatch = data.evidence?.find((e: any) => e.source === c.pdf_name && (e.page === c.page_number || !e.page));
+            mappedSources.push({
+              document_id: String(c.chunk_id || c.citation_id),
+              citation_id: c.citation_id,
+              title: c.pdf_name || "Clinical Document",
+              page: c.page_number || 1,
+              section: c.section || "General",
+              subsection: c.subsection,
+              relevance: c.authority_score || 0.8,
+              supporting_text: evMatch?.supporting_text || c.supporting_text || ""
+            });
+          });
+        } else if (data.sources && Array.isArray(data.sources)) {
+          mappedSources.push(...data.sources);
+        } else if (data.evidence && Array.isArray(data.evidence)) {
+          data.evidence.forEach((ev: any, idx: number) => {
+            mappedSources.push({
+              document_id: String(ev.chunk_id || idx + 1),
+              citation_id: idx + 1,
+              title: ev.source || ev.title || "Clinical Document",
+              page: ev.page || 1,
+              section: ev.section || "Clinical Assessment",
+              relevance: 0.85,
+              supporting_text: ev.supporting_text || ""
+            });
+          });
+        }
+
         setMessages((prev) => [
           ...prev,
           {
             id: data.id,
             role: "assistant",
-            content: data.content,
+            content: data.content || data.answer || "",
             mode: data.mode,
             confidence_level: data.confidence_level,
             confidence_score: data.confidence_score,
-            sources: data.sources,
+            sources: mappedSources,
             evidence: data.evidence,
           },
         ]);
@@ -221,18 +276,38 @@ export const App: React.FC = () => {
         ]);
       }
     } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err-${Date.now()}`,
-          role: "assistant",
-          content: "Unable to reach Clinical RAG service.",
-          confidence_level: "Low",
-        },
-      ]);
+      if (err.name === "AbortError") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `stop-${Date.now()}`,
+            role: "assistant",
+            content: "*Clinical consultation response stopped by user.*",
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: "assistant",
+            content: "Unable to reach Clinical RAG service.",
+            confidence_level: "Low",
+          },
+        ]);
+      }
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
+  };
+
+  const handleStopGeneration = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsLoading(false);
   };
 
   const handleSelectPatientForChat = (patientId: string) => {
@@ -271,6 +346,7 @@ export const App: React.FC = () => {
           <ChatArea
             messages={messages}
             onSendMessage={handleSendMessage}
+            onStopGeneration={handleStopGeneration}
             isLoading={isLoading}
             patients={patients}
             selectedPatientId={selectedPatientId}
@@ -289,7 +365,6 @@ export const App: React.FC = () => {
         {activeView === "radiology" && <RadiologyWorkspace patients={patients} />}
         {activeView === "laboratory" && <LaboratoryWorkspace patients={patients} />}
         {activeView === "knowledge_base" && <KnowledgeBaseView currentUser={currentUser} />}
-        {activeView === "documents" && <DocumentLibrary currentUser={currentUser} />}
         {activeView === "users" && <UserManagement />}
         {activeView === "audit_logs" && <AuditLogView />}
       </main>

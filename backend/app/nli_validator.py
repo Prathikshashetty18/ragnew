@@ -53,9 +53,10 @@ def check_clinical_contradiction(premise: str, hypothesis: str) -> Tuple[bool, s
     p_tokens = set(re.findall(r'\w+', p_lower))
     h_tokens = set(re.findall(r'\w+', h_lower))
     
-    # 1. Check direct antonym pairs where premise has term A and hypothesis has term B
+    # 1. Check direct antonym pairs where premise has term A (and not B) but hypothesis flipped to term B (and not A)
     for term_a, term_b in CONTRADICTION_PAIRS:
-        if (term_a in p_tokens and term_b in h_tokens) or (term_b in p_tokens and term_a in h_tokens):
+        if (term_a in p_tokens and term_b not in p_tokens and term_b in h_tokens and term_a not in h_tokens) or \
+           (term_b in p_tokens and term_a not in p_tokens and term_a in h_tokens and term_b not in h_tokens):
             overlap = p_tokens.intersection(h_tokens) - {"is", "are", "the", "a", "an", "and", "in", "to", "for", "with", "of"}
             if len(overlap) >= 2:
                 return True, f"Opposing clinical relationship detected ({term_a} vs {term_b})."
@@ -90,6 +91,14 @@ def extract_claims(text: str) -> List[str]:
     ]
     
     for line in lines:
+        raw_line = line.strip()
+        # Skip markdown headers (# ..., ## ..., ### ..., #### ...)
+        if raw_line.startswith("#"):
+            continue
+        # Skip patient metadata banner lines (e.g. **Patient:** ... | **Age/Gender:** ...)
+        if re.match(r'^\*{0,2}(?:Patient|Age|Gender|Department|Date|Status|Attending Doctor):', raw_line, flags=re.IGNORECASE):
+            continue
+
         # Strip list markers like '1. ', '- ', '* ', '• '
         clean_line = re.sub(r'^(?:\d+\.|\-|\*|•)\s+', '', line).strip()
         # Strip header markers like '### '
@@ -277,17 +286,13 @@ def validate_response_with_nli(
                 best_ctx_idx = int(top_k_indices[best_ce_local_idx])
                 best_ctx = context_premises_metadata[best_ctx_idx]
         
-        # Check for clinical contradiction across top candidate premises
+        # Check for clinical contradiction against the best-matching premise
         is_contra = False
         contra_reason = ""
-        for idx in top_k_indices[:5]:
-            cand_p = context_premises_metadata[int(idx)]
-            c_flag, c_msg = check_clinical_contradiction(cand_p["text"], r_sent)
-            if c_flag:
-                is_contra = True
-                contra_reason = c_msg
-                best_ctx = cand_p
-                break
+        c_flag, c_msg = check_clinical_contradiction(best_ctx["text"], r_sent)
+        if c_flag:
+            is_contra = True
+            contra_reason = c_msg
         
         if is_contra:
             nli_label = "Contradiction"
@@ -320,7 +325,11 @@ def validate_response_with_nli(
         
         # Structured Backend Debug Logging for each generated sentence:
         # max_sim, ce_score, nli_label, status, selected source page
-        print(f"Sentence: \"{r_sent}\" | max_sim: {max_sim:.3f} | ce_score: {ce_score:.3f} | nli_label: {nli_label} | status: {status} | source_page: {selected_source_page} ({best_ctx['pdf_name']})")
+        safe_log = f"Sentence: \"{r_sent}\" | max_sim: {max_sim:.3f} | ce_score: {ce_score:.3f} | nli_label: {nli_label} | status: {status} | source_page: {selected_source_page} ({best_ctx['pdf_name']})"
+        try:
+            print(safe_log)
+        except UnicodeEncodeError:
+            print(safe_log.encode("ascii", errors="replace").decode("ascii"))
         
         # Select clean source sentence display
         source_display = best_ctx["text"]

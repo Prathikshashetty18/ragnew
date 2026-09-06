@@ -117,27 +117,29 @@ class HierarchicalClinicalChunker:
                 if current_lines:
                     blocks.append((current_section, current_subsection, " ".join(current_lines)))
                     current_lines = []
-                if re.match(r'^(?:SECTION|CHAPTER|PART)\s+\d+', line_str, re.IGNORECASE):
-                    current_section = line_str
-                elif ":" in line_str:
-                    parts = line_str.split(":", 1)
+                clean_sec_str = re.sub(r'^#+\s*', '', line_str).strip()
+                if re.match(r'^(?:SECTION|CHAPTER|PART)\s+\d+', clean_sec_str, re.IGNORECASE):
+                    current_section = clean_sec_str
+                elif ":" in clean_sec_str:
+                    parts = clean_sec_str.split(":", 1)
                     current_section = parts[0].strip()
                     if parts[1].strip():
                         current_lines.append(parts[1].strip())
                 else:
-                    current_section = line_str
+                    current_section = clean_sec_str
                 current_subsection = "Overview"
             elif is_subsection:
                 if current_lines:
                     blocks.append((current_section, current_subsection, " ".join(current_lines)))
                     current_lines = []
-                if ":" in line_str:
-                    parts = line_str.split(":", 1)
+                clean_sub_str = re.sub(r'^#+\s*', '', line_str).strip()
+                if ":" in clean_sub_str:
+                    parts = clean_sub_str.split(":", 1)
                     current_subsection = parts[0].strip()
                     if parts[1].strip():
                         current_lines.append(parts[1].strip())
                 else:
-                    current_subsection = line_str
+                    current_subsection = clean_sub_str
             else:
                 current_lines.append(line_str)
 
@@ -168,16 +170,21 @@ class HierarchicalClinicalChunker:
             if len(clean_text) < 20:
                 continue
 
+            clean_sec = re.sub(r'^#+\s*', '', section).strip()
+            clean_sub = re.sub(r'^#+\s*', '', subsection).strip()
+
             # If block fits within chunk_size, keep as a single cohesive unit
             if len(clean_text) <= self.chunk_size:
                 chunk_id = str(uuid.uuid4())
                 contextualized = ContextualChunkEnricher.enrich(
                     text=clean_text,
                     pdf_name=pdf_name,
-                    section=section,
-                    subsection=subsection,
+                    section=clean_sec,
+                    subsection=clean_sub,
                     disease=disease,
-                    version=version
+                    version=version,
+                    scope=scope,
+                    patient_id=patient_id
                 )
                 chunks.append({
                     "id": chunk_id,
@@ -194,9 +201,9 @@ class HierarchicalClinicalChunker:
                     "patient_id": patient_id,
                     "version": version,
                     "document_type": document_type,
-                    "section": section,
-                    "subsection": subsection,
-                    "parent_section": section,
+                    "section": clean_sec,
+                    "subsection": clean_sub,
+                    "parent_section": clean_sec,
                     "disease": disease,
                     "condition": disease,
                     "authority_score": authority_score,
@@ -216,10 +223,12 @@ class HierarchicalClinicalChunker:
                         contextualized = ContextualChunkEnricher.enrich(
                             text=chunk_content,
                             pdf_name=pdf_name,
-                            section=section,
-                            subsection=subsection,
+                            section=clean_sec,
+                            subsection=clean_sub,
                             disease=disease,
-                            version=version
+                            version=version,
+                            scope=scope,
+                            patient_id=patient_id
                         )
                         chunks.append({
                             "id": chunk_id,
@@ -236,9 +245,9 @@ class HierarchicalClinicalChunker:
                             "patient_id": patient_id,
                             "version": version,
                             "document_type": document_type,
-                            "section": section,
-                            "subsection": subsection,
-                            "parent_section": section,
+                            "section": clean_sec,
+                            "subsection": clean_sub,
+                            "parent_section": clean_sec,
                             "disease": disease,
                             "condition": disease,
                             "authority_score": authority_score,
@@ -266,10 +275,12 @@ class HierarchicalClinicalChunker:
                     contextualized = ContextualChunkEnricher.enrich(
                         text=chunk_content,
                         pdf_name=pdf_name,
-                        section=section,
-                        subsection=subsection,
+                        section=clean_sec,
+                        subsection=clean_sub,
                         disease=disease,
-                        version=version
+                        version=version,
+                        scope=scope,
+                        patient_id=patient_id
                     )
                     chunks.append({
                         "id": chunk_id,
@@ -286,9 +297,9 @@ class HierarchicalClinicalChunker:
                         "patient_id": patient_id,
                         "version": version,
                         "document_type": document_type,
-                        "section": section,
-                        "subsection": subsection,
-                        "parent_section": section,
+                        "section": clean_sec,
+                        "subsection": clean_sub,
+                        "parent_section": clean_sec,
                         "disease": disease,
                         "condition": disease,
                         "authority_score": authority_score,
@@ -302,7 +313,22 @@ class ContextualChunkEnricher:
     """Enriches chunk text with structural document provenance."""
 
     @staticmethod
-    def enrich(text: str, pdf_name: str, section: str, subsection: str, disease: str, version: str = "1.0") -> str:
-        clean_name = pdf_name.replace(".pdf", "").replace("_", " ")
-        header = f"Document: {clean_name} (Ver: {version}). Section: {section}. Subsection: {subsection}. Topic: {disease}."
+    def enrich(
+        text: str,
+        pdf_name: str,
+        section: str,
+        subsection: str,
+        disease: str,
+        version: str = "1.0",
+        scope: str = "knowledge_base",
+        patient_id: Optional[str] = None
+    ) -> str:
+        clean_name = pdf_name.replace(".pdf", "").replace(".txt", "").replace("_", " ")
+        clean_section = re.sub(r'^#+\s*', '', section).strip()
+        clean_subsection = re.sub(r'^#+\s*', '', subsection).strip()
+        if scope == "patient" and patient_id:
+            header = f"Patient Record: {patient_id}. Document: {clean_name}. Section: {clean_section}."
+        else:
+            header = f"Document: {clean_name} (Ver: {version}). Section: {clean_section}. Subsection: {clean_subsection}. Topic: {disease}."
         return f"{header}\n{text}"
+

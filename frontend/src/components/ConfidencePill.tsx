@@ -5,7 +5,11 @@ export interface ConfidencePillProps {
   score?: number;
 }
 
-export const ConfidencePill: React.FC<ConfidencePillProps> = ({ level = "High", score }) => {
+export const ConfidencePill: React.FC<ConfidencePillProps> = ({ level, score }) => {
+  if (!level && (score === undefined || score === null)) {
+    return null;
+  }
+
   const normLevel = (level || "High").trim();
   const lower = normLevel.toLowerCase();
 

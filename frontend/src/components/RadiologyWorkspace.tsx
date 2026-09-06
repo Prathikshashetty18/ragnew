@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Image as ImageIcon, Upload, CheckCircle, AlertCircle } from "lucide-react";
+import { Image as ImageIcon, Upload, CheckCircle, AlertCircle, Trash2 } from "lucide-react";
 import type { Patient, RadiologyRecord } from "../types";
 
 interface RadiologyWorkspaceProps {
@@ -33,6 +33,27 @@ export const RadiologyWorkspace: React.FC<RadiologyWorkspaceProps> = ({ patients
   useEffect(() => {
     fetchRecords();
   }, []);
+
+  const handleDeleteRecord = async (recordId: number) => {
+    if (!window.confirm("Are you sure you want to delete this radiology report?")) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/radiology/${recordId}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+      });
+      if (res.ok) {
+        setRecords((prev) => prev.filter((item) => item.id !== recordId));
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Failed to delete radiology record.");
+      }
+    } catch (e) {
+      console.error("Failed to delete radiology record:", e);
+      alert("Failed to delete radiology record.");
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -208,9 +229,18 @@ export const RadiologyWorkspace: React.FC<RadiologyWorkspaceProps> = ({ patients
                         <h4 className="text-xs font-bold text-slate-900">{r.modality}</h4>
                         <p className="text-[11px] text-slate-500">Patient: <strong>{r.patient_name}</strong> ({r.patient_id})</p>
                       </div>
-                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                        {r.status}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                          {r.status}
+                        </span>
+                        <button
+                          onClick={() => handleDeleteRecord(r.id)}
+                          title="Delete Radiology Record"
+                          className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1 rounded transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
 
                     <p className="text-xs text-slate-700 mb-2 leading-relaxed">

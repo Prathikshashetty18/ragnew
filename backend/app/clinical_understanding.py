@@ -281,6 +281,8 @@ class ClinicalQueryExpander:
             for cond in all_conditions:
                 cond_display = cond.replace("_", " ")
                 variants.append(f"{inv_display} in {cond_display} clinical guideline")
+            if not all_conditions:
+                variants.append(f"{inv_display} findings report")
 
         # Variant: Symptom cluster concept
         symptoms = entities.get("symptoms", [])

@@ -100,8 +100,35 @@ def evaluate_medical_relevance(text: str) -> Dict[str, Any]:
         "reason": reason
     }
 
-def detect_version_and_duplicates(filename: str, file_hash: str, db: Session, DocumentModel) -> Dict[str, Any]:
-    existing_duplicate = db.query(DocumentModel).filter(DocumentModel.hash_md5 == file_hash).first()
+def detect_version_and_duplicates(
+    filename: str, 
+    file_hash: str, 
+    db: Session, 
+    DocumentModel, 
+    target_scope: str = "knowledge_base"
+) -> Dict[str, Any]:
+    # Temporary chat attachments are ephemeral query contexts and are never rejected as duplicates
+    if target_scope == "temporary":
+        return {
+            "is_duplicate": False,
+            "duplicate_of_id": None,
+            "duplicate_of_name": None,
+            "version": "1.0",
+            "flag": "NONE",
+            "message": "Temporary chat attachment."
+        }
+        
+    # Scope-aware duplicate query: ignore soft-deleted documents
+    query = db.query(DocumentModel).filter(
+        DocumentModel.hash_md5 == file_hash,
+        DocumentModel.approval_status != "DELETED"
+    )
+    if target_scope == "knowledge_base":
+        query = query.filter(DocumentModel.scope == "knowledge_base")
+    elif target_scope == "patient":
+        query = query.filter(DocumentModel.scope == "patient")
+        
+    existing_duplicate = query.first()
     if existing_duplicate:
         return {
             "is_duplicate": True,
@@ -109,7 +136,7 @@ def detect_version_and_duplicates(filename: str, file_hash: str, db: Session, Do
             "duplicate_of_name": existing_duplicate.name,
             "version": existing_duplicate.version,
             "flag": "DUPLICATE",
-            "message": f"Exact duplicate of existing document '{existing_duplicate.name}' (ID: {existing_duplicate.id})."
+            "message": f"Exact duplicate of existing {existing_duplicate.scope} document '{existing_duplicate.name}' (ID: {existing_duplicate.id})."
         }
         
     version_match = re.search(r'v(?:er(?:sion)?)?[\s_.-]*(\d+(?:\.\d+)?)', filename, re.IGNORECASE)

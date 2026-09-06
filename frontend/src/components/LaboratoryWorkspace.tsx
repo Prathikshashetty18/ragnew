@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { TestTube, Upload, CheckCircle } from "lucide-react";
+import { TestTube, Upload, CheckCircle, Trash2 } from "lucide-react";
 import type { Patient, LabResult } from "../types";
 
 interface LaboratoryWorkspaceProps {
@@ -35,6 +35,27 @@ export const LaboratoryWorkspace: React.FC<LaboratoryWorkspaceProps> = ({ patien
   useEffect(() => {
     fetchRecords();
   }, []);
+
+  const handleDeleteRecord = async (recordId: number) => {
+    if (!window.confirm("Are you sure you want to delete this laboratory panel?")) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/laboratory/${recordId}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+      });
+      if (res.ok) {
+        setRecords((prev) => prev.filter((item) => item.id !== recordId));
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Failed to delete laboratory record.");
+      }
+    } catch (e) {
+      console.error("Failed to delete laboratory record:", e);
+      alert("Failed to delete laboratory record.");
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -223,9 +244,18 @@ export const LaboratoryWorkspace: React.FC<LaboratoryWorkspaceProps> = ({ patien
                       <h4 className="text-xs font-bold text-slate-900">
                         Patient: {l.patient_name || l.patient_id}
                       </h4>
-                      <span className="text-[10px] text-slate-400">
-                        {new Date(l.timestamp).toLocaleDateString()}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] text-slate-400">
+                          {new Date(l.timestamp).toLocaleDateString()}
+                        </span>
+                        <button
+                          onClick={() => handleDeleteRecord(l.id)}
+                          title="Delete Laboratory Record"
+                          className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1 rounded transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 text-xs text-slate-700 bg-white p-2.5 rounded-lg border border-slate-100 mb-2">

@@ -45,7 +45,26 @@ def build_patient_context_summary(patient_id: str, db: Session) -> Dict[str, Any
     vitals_text = "No vitals recorded."
     if vitals:
         v_latest = vitals[0]
-        vitals_text = f"BP: {v_latest.blood_pressure} mmHg, Pulse: {v_latest.pulse} bpm, Temp: {v_latest.temperature} C, SpO2: {v_latest.spo2}%. Notes: {v_latest.notes or 'None'}"
+        v_parts = []
+        if v_latest.blood_pressure:
+            v_parts.append(f"BP: {v_latest.blood_pressure} mmHg")
+        if v_latest.pulse is not None:
+            v_parts.append(f"Pulse/HR: {v_latest.pulse} bpm")
+        if v_latest.respiratory_rate is not None:
+            v_parts.append(f"Respiratory Rate: {v_latest.respiratory_rate} /min")
+        if v_latest.temperature is not None:
+            v_parts.append(f"Temp: {v_latest.temperature} °C")
+        if v_latest.spo2 is not None:
+            v_parts.append(f"SpO2: {v_latest.spo2}%")
+        if v_latest.blood_glucose is not None:
+            v_parts.append(f"Blood Glucose: {v_latest.blood_glucose} mg/dL")
+        if v_latest.pain_score is not None:
+            v_parts.append(f"Pain Score: {v_latest.pain_score}/10")
+        if v_latest.intake_output:
+            v_parts.append(f"Intake/Output: {v_latest.intake_output}")
+        if v_latest.notes:
+            v_parts.append(f"Notes: {v_latest.notes}")
+        vitals_text = ", ".join(v_parts) if v_parts else "No vitals recorded."
         
     # Format labs text
     labs_text = "No laboratory records."
@@ -195,9 +214,6 @@ Output ONLY valid JSON."""
         db.add(db_report)
         db.commit()
         db.refresh(db_report)
-        
-        # Sync generated report into Knowledge Base (FAISS + BM25)
-        sync_report_to_knowledge_base(db_report, doctor_user, db)
     except Exception as e:
         db.rollback()
         raise e
@@ -352,3 +368,30 @@ def sync_report_to_knowledge_base(report: ClinicalReport, user: Optional[User], 
     except Exception as e:
         print(f"Error syncing report {report.id} to Knowledge Base: {e}")
         return None
+
+
+def reconcile_unindexed_clinical_reports(db: Session) -> int:
+    """
+    Scans ClinicalReport rows in the database, checks if the matching Document
+    is missing or has chunk_count == 0, and syncs/indexes it into the Knowledge Base.
+    """
+    reconciled_count = 0
+    try:
+        reports = db.query(ClinicalReport).filter(ClinicalReport.status == "APPROVED").all()
+        for report in reports:
+            doc_filename = f"Clinical_Report_{report.patient_id}_Report{report.id}.txt"
+            matching_doc = db.query(Document).filter(
+                (Document.name == doc_filename) |
+                ((Document.patient_id == report.patient_id) & (Document.document_type == "clinical_report") & (Document.name.like(f"%Report{report.id}%")))
+            ).first()
+            
+            if not matching_doc or matching_doc.chunk_count == 0 or matching_doc.status != "ready":
+                print(f"Reconciling unindexed clinical report: ID={report.id}, Patient={report.patient_id}")
+                doc = sync_report_to_knowledge_base(report, report.doctor, db)
+                if doc and doc.chunk_count > 0:
+                    reconciled_count += 1
+        print(f"Reconciliation complete: {reconciled_count} clinical reports indexed.")
+    except Exception as e:
+        print(f"Error during reconcile_unindexed_clinical_reports: {e}")
+    return reconciled_count
+

@@ -323,12 +323,40 @@ class CrossEncoderReranker:
                 pairs = [[query, c.get("contextualized_text") or c.get("text", "")] for c in prepared]
                 raw_scores = cross_encoder.predict(pairs)
 
+                q_lower = query.lower()
+                is_vitals_query = bool(re.search(r'\b(vital|vitals|signs|observation|observations|temp|temperature|bp|blood pressure|pulse|heart rate|spo2|oxygen|fever)\b', q_lower))
+                is_labs_query = bool(re.search(r'\b(lab|labs|investigation|investigations|blood|hemoglobin|wbc|platelets|crp|radiology|xray|x-ray|chest|ct|imaging|scan|infiltrate|consolidation)\b', q_lower))
+                is_treatment_query = bool(re.search(r'\b(treatment|plan|recommendation|recommendations|medication|antibiotic|antimicrobial|dosage|dose|ceftriaxone|amoxicillin|azithromycin|discharge|monitoring|therapy|prescribe)\b', q_lower))
+                is_assessment_query = bool(re.search(r'\b(assessment|diagnosis|diagnosed|curb|curb-65|severity|condition)\b', q_lower))
+                is_complaint_query = bool(re.search(r'\b(complaint|chief|symptom|symptoms|history|presenting|cough|chest pain|dyspnea)\b', q_lower))
+
                 for i, score in enumerate(raw_scores):
                     authority = prepared[i].get("authority_score", 0.8)
-                    # Sigmoid-normalized score adjusted by authority
                     norm_score = float(1.0 / (1.0 + math.exp(-score)))
-                    adjusted_score = norm_score * (0.85 + 0.15 * authority)
-                    prepared[i]["rerank_score"] = float(adjusted_score)
+
+                    sec = (prepared[i].get("section") or "").upper()
+                    parent_sec = (prepared[i].get("parent_section") or "").upper()
+                    full_sec = f"{sec} {parent_sec}"
+                    chunk_text = prepared[i].get("text", "")
+
+                    section_boost = 0.0
+                    if is_vitals_query and ("OBSERVATION" in full_sec or "VITAL" in full_sec or "BP:" in chunk_text):
+                        section_boost += 0.06
+                    elif is_labs_query and ("INVESTIGATION" in full_sec or "LAB" in full_sec or "RADIOLOGY" in full_sec or "Hemoglobin:" in chunk_text or "CBC" in chunk_text):
+                        section_boost += 0.06
+                    elif is_treatment_query and ("RECOMMENDATION" in full_sec or "TREATMENT" in full_sec or "ANTIMICROBIAL" in full_sec or "THERAPY" in full_sec):
+                        section_boost += 0.06
+                    elif is_assessment_query and ("ASSESSMENT" in full_sec or "DIAGNOSIS" in full_sec):
+                        section_boost += 0.06
+                    elif is_complaint_query and ("CHIEF COMPLAINT" in full_sec or "HISTORY" in full_sec or "SYMPTOM" in full_sec):
+                        section_boost += 0.06
+
+                    if (is_vitals_query or is_labs_query or is_treatment_query or is_assessment_query or is_complaint_query):
+                        if sec in ["GENERAL OVERVIEW", "GENERAL", "METADATA"] and ("REPORT ID:" in chunk_text or "# CLINICAL PATIENT REPORT" in chunk_text):
+                            section_boost -= 0.05
+
+                    adjusted_score = (norm_score + section_boost) * (0.85 + 0.15 * authority)
+                    prepared[i]["rerank_score"] = float(max(0.0, min(1.0, adjusted_score)))
                     prepared[i]["raw_rerank_score"] = float(score)
 
                 prepared.sort(key=lambda x: x["rerank_score"], reverse=True)

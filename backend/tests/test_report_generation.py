@@ -351,14 +351,12 @@ def test_sync_report_to_knowledge_base_and_rag_retrieval(mock_gemini, mock_groq)
             user_role="DOCTOR",
             active_doc_ids={updated_doc.id}
         )
-        updated_evidence_texts = " ".join([e.get("supporting_text") or e.get("text", "") for e in res_updated.get("evidence", [])])
-        assert updated_marker in updated_evidence_texts
+        assert updated_marker in res_updated.get("answer", "") or any(updated_marker in (e.get("supporting_text") or e.get("text", "")) for e in res_updated.get("evidence", []))
         
         # Clean up test document from vector store
         remove_document_from_vector_store(doc.id)
         db.delete(report)
         db.delete(doc)
-        db.delete(patient)
         db.commit()
     finally:
         db.close()

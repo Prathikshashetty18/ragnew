@@ -176,8 +176,18 @@ def remove_document_from_vector_store(doc_id: int):
 
 
 def split_into_sentences(text: str) -> List[str]:
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [s.strip() for s in sentences if len(s.strip()) > 5]
+    lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+    results = []
+    for line in lines:
+        sents = re.split(r'(?<=[a-zA-Z\)])(?<=[.!?])\s+', line)
+        for s in sents:
+            s_clean = s.strip()
+            if len(s_clean) > 5:
+                results.append(s_clean)
+    if not results:
+        sents = re.split(r'(?<=[.!?])\s+', text.strip())
+        results = [s.strip() for s in sents if len(s.strip()) > 5]
+    return results
 
 
 def process_pdf(
@@ -324,11 +334,16 @@ DEFAULT_STRICT_RAG_SYSTEM_PROMPT = (
     "7. Annotate medical claims with their corresponding bracketed source reference, e.g., [1], [2]."
 )
 
+DEFAULT_DIRECT_LLM_SYSTEM_PROMPT = (
+    "You are an expert clinical medical assistant. Answer the medical question directly, thoroughly, and professionally "
+    "using general clinical medical knowledge and evidence-based medicine principles. Format your answer cleanly and elegantly in markdown."
+)
+
 
 def call_groq_llm(prompt: str, max_tokens: int = 4096, system_prompt: Optional[str] = None) -> str:
     try:
         sys_content = system_prompt or DEFAULT_STRICT_RAG_SYSTEM_PROMPT
-        client = Groq(api_key=GROQ_API_KEY)
+        client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
         completion = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -338,7 +353,7 @@ def call_groq_llm(prompt: str, max_tokens: int = 4096, system_prompt: Optional[s
                 },
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.05,
+            temperature=0.3 if system_prompt == DEFAULT_DIRECT_LLM_SYSTEM_PROMPT else 0.05,
             max_tokens=max_tokens
         )
         return completion.choices[0].message.content
@@ -383,40 +398,474 @@ def call_gemini_fallback(prompt: str, system_prompt: Optional[str] = None) -> st
         raise e
 
 
+def is_historical_patient_query(query: str) -> bool:
+    """
+    Detects if the query explicitly asks for historical reports, previous values,
+    trends over time, or report comparisons.
+    """
+    q_lower = query.lower()
+    historical_patterns = [
+        r'\b(?:previous|prior|earlier|old|older|past|initial|baseline|first)\b',
+        r'\b(?:history|historical|progression|trend|timeline|evolution)\b',
+        r'\b(?:compare|comparison|difference|differences|changed|change|changes)\b',
+        r'\b(?:report\s*(?:1|2|3|4|5|6|7|8|9|one|two|three|four|five|six|seven))\b',
+        r'\b(?:previous\s*report|prior\s*report|earlier\s*report|old\s*report)\b'
+    ]
+    for pat in historical_patterns:
+        if re.search(pat, q_lower):
+            return True
+    return False
+
+
+def get_patient_active_reports(patient_id: str, db: Optional[Any] = None) -> List[Any]:
+    """
+    Retrieves active (non-archived) ClinicalReport records for a patient,
+    sorted newest first (created_at DESC, id DESC).
+    """
+    close_db = False
+    if db is None:
+        try:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            close_db = True
+        except Exception:
+            return []
+    try:
+        from app.database import ClinicalReport
+        reports = db.query(ClinicalReport).filter(
+            ClinicalReport.patient_id == patient_id,
+            ClinicalReport.status != 'ARCHIVED'
+        ).order_by(ClinicalReport.created_at.desc(), ClinicalReport.id.desc()).all()
+        return reports
+    except Exception as e:
+        print(f"Error fetching active reports for patient {patient_id}: {e}")
+        return []
+    finally:
+        if close_db and db:
+            db.close()
+
+
 def generate_mock_answer(query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
-    """Generates an evidence-grounded response when external LLM APIs are unreachable."""
+    """
+    Generates a structured, evidence-grounded clinical response cleanly tailored
+    to the clinician's specific question using retrieved evidence chunks.
+    """
     if not retrieved_chunks:
-        return "I could not find sufficient supporting evidence in the authorized clinical guidelines to answer this question."
+        return "Insufficient evidence in the hospital knowledge base to answer this question reliably."
 
-    sentences = []
-    for idx, chunk in enumerate(retrieved_chunks):
-        c_sents = split_into_sentences(chunk.get("text", ""))
-        for s in c_sents:
-            sentences.append((s, chunk.get("pdf_name", "Guideline"), chunk.get("page_number", 1), idx + 1))
+    metadata_header_patterns = [
+        r'^(?:REPORT ID|STATUS|DATE GENERATED|PATIENT ID|PATIENT NAME|AGE|GENDER|DEPARTMENT|ATTENDING DOCTOR|CREATED):',
+        r'^#+\s*CLINICAL PATIENT REPORT',
+        r'^#+\s*HOSPITAL APPROVED CLINICAL PRACTICE GUIDELINE',
+        r'^DOCUMENT REF:',
+        r'^APPROVAL COMMITTEE:',
+        r'^SECTION \d+:',
+        r'^\d+\.\d+\s+(?:DIAGNOSTIC CRITERIA|EMPIRICAL ANTIMICROBIAL THERAPY|RISK STRATIFICATION|MONITORING|CLINICAL SUSPICION):?'
+    ]
 
-    query_words = set(re.findall(r'\w+', query.lower())) - {"what", "is", "are", "the", "for", "and", "in", "to", "of", "a", "an"}
-    scored = []
-    for s, src, page, ref_id in sentences:
-        s_words = set(re.findall(r'\w+', s.lower()))
-        common = query_words.intersection(s_words)
-        if common:
-            scored.append((len(common), f"{s} [{ref_id}]"))
+    q_lower = query.lower()
+    q_words = set(re.findall(r'\w+', q_lower)) - {
+        "what", "is", "are", "the", "for", "and", "in", "to", "of", "a", "an",
+        "was", "were", "did", "show", "give", "report", "patient", "clinical",
+        "tell", "me", "about", "please", "can", "you", "does", "have", "with",
+        "guideline", "guidelines", "protocol", "protocols"
+    }
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # Helper: Clean document header / metadata text
+    def clean_clinical_text(text_str: str) -> str:
+        s = text_str.strip()
+        # Drop entire line if it contains document/report header metadata
+        if re.search(r'\b(?:REPORT ID|PATIENT ID|ATTENDING DOCTOR|APPROVAL COMMITTEE|DOCUMENT REF)\b', s, re.IGNORECASE):
+            return ""
+        if re.search(r'^#+\s*(?:CLINICAL PATIENT REPORT|HOSPITAL APPROVED)', s, re.IGNORECASE):
+            return ""
+        if re.search(r'^(?:STATUS|CREATED|PATIENT NAME|DEPARTMENT|AGE|GENDER):\s*', s, re.IGNORECASE):
+            return ""
+        # Drop publisher / journal headers, volume/issue headers, ISSN, and web links
+        if re.search(r'(?:www\.[a-z0-9\-]+\.[a-z]+|http[s]?://\S+|©\s*\d{4}|\bISSN:\s*[0-9\-]+|\bVolume\s+\d+,\s*Issue\s+\d+|\bIJCRT\w*)', s, re.IGNORECASE):
+            s = re.sub(r'(?:www\.[a-z0-9\-]+\.[a-z]+|http[s]?://\S+|©\s*\d{4}|\bISSN:\s*[0-9\-]+|\bVolume\s+\d+,\s*Issue\s+\d+|\bIJCRT\w*)', '', s, flags=re.IGNORECASE).strip(' -–—|:,')
+            if len(re.sub(r'[^a-zA-Z0-9]', '', s)) < 8:
+                return ""
+        for pat in metadata_header_patterns:
+            s = re.sub(pat, '', s, flags=re.IGNORECASE).strip()
+        # Clean leading markdown headers or colons
+        s = re.sub(r'^(?:#+\s*)+', '', s).strip()
+        s = re.sub(r'^(?:OBSERVATIONS\s*(?:&|AND)?\s*VITALS|INVESTIGATIONS\s*(?:&|AND)?\s*LABS|CLINICAL ASSESSMENT\s*(?:&|AND)?\s*DIAGNOSIS|RECOMMENDATIONS\s*(?:&|AND)?\s*TREATMENT PLAN|CHIEF COMPLAINT|CLINICAL HISTORY):\s*', '', s, flags=re.IGNORECASE).strip()
+        # Clean leading bullet symbols or list numbers so bullets are never doubled ("- - ")
+        s = re.sub(r'^(?:[-*•]|\d+[.)])\s*', '', s).strip()
+        return s
 
-    if scored:
-        top_sentences = [item[1] for item in scored[:3]]
-        answer = "Based on the verified clinical documents: " + " ".join(top_sentences)
-    else:
-        # Fallback to the first available clinical sentence from top chunk
-        first_chunk = retrieved_chunks[0]
-        first_sent = split_into_sentences(first_chunk.get("text", ""))[0] if first_chunk.get("text") else ""
-        if first_sent:
-            answer = f"According to {first_chunk.get('pdf_name', 'clinical guidelines')}: {first_sent} [1]"
+    # Detect clinical dimension intent
+    has_vitals_intent = bool(re.search(r'\b(vital|vitals|signs|observation|observations|temp|temperature|bp|blood pressure|pulse|heart rate|spo2|oxygen|fever)\b', q_lower))
+    has_labs_intent = bool(re.search(r'\b(lab|labs|investigation|investigations|blood|hemoglobin|wbc|platelets|crp|radiology|xray|x-ray|chest|ct|imaging|scan|infiltrate|consolidation)\b', q_lower))
+    has_assessment_intent = bool(re.search(r'\b(assessment|diagnosis|diagnosed|curb|curb-65|severity|condition)\b', q_lower))
+    has_treatment_intent = bool(re.search(r'\b(treatment|plan|recommendation|recommendations|medication|antibiotic|antimicrobial|dosage|dose|ceftriaxone|amoxicillin|azithromycin|discharge|monitoring|therapy|prescribe)\b', q_lower))
+    has_complaint_intent = bool(re.search(r'\b(complaint|chief|symptom|symptoms|history|presenting|cough|chest pain|dyspnea)\b', q_lower))
+    is_general_summary = bool(re.search(r'\b(summarize|summary|overview|entire report|whole report|full report)\b', q_lower))
+
+    # Extract patient metadata if available from retrieved chunks
+    patient_info = {}
+    for chunk in retrieved_chunks:
+        c_text = chunk.get("text", "")
+        if "patient_name" in chunk and chunk["patient_name"]:
+            patient_info["name"] = chunk["patient_name"]
         else:
-            answer = "I could not find sufficient supporting evidence in the retrieved documents to answer this question reliably."
+            m_name = re.search(r'(?:PATIENT NAME|PATIENT|Patient):\s*([^\n,|]+)', c_text, re.IGNORECASE)
+            if m_name and "name" not in patient_info:
+                patient_info["name"] = m_name.group(1).strip()
 
-    return answer
+        m_age = re.search(r'(?:AGE|Age):\s*(\d+)', c_text, re.IGNORECASE)
+        if m_age and "age" not in patient_info:
+            patient_info["age"] = f"{m_age.group(1).strip()} years"
+
+        m_gender = re.search(r'(?:GENDER|Gender|Sex):\s*([^\n,|]+)', c_text, re.IGNORECASE)
+        if m_gender and "gender" not in patient_info:
+            g_str = m_gender.group(1).strip()
+            if g_str.lower().startswith("m"):
+                patient_info["gender"] = "Male"
+            elif g_str.lower().startswith("f"):
+                patient_info["gender"] = "Female"
+            else:
+                patient_info["gender"] = g_str
+
+        m_dept = re.search(r'(?:DEPARTMENT|Department):\s*([^\n,|]+)', c_text, re.IGNORECASE)
+        if m_dept and "dept" not in patient_info:
+            patient_info["dept"] = m_dept.group(1).strip()
+
+    # 1. Collect candidate statements categorized by topic
+    # Each entry: (statement, ref_id, chunk_score)
+    categorized_facts: Dict[str, List[Tuple[str, int, float]]] = {
+        "observations": [],
+        "investigations": [],
+        "assessment": [],
+        "treatment": [],
+        "complaint": [],
+        "guideline_statements": []
+    }
+
+    for idx, chunk in enumerate(retrieved_chunks):
+        ref_id = idx + 1
+        chunk_score = chunk.get("rerank_score", chunk.get("dense_score", 1.0 / (idx + 1)))
+        text = chunk.get("text", "")
+        sec_name = chunk.get("section", "").upper()
+
+        raw_lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        for line in raw_lines:
+            clean = clean_clinical_text(line)
+            if not clean or len(clean) < 4:
+                continue
+
+            # Check if this is a patient observation/vitals line
+            if "OBSERVATION" in sec_name or "VITAL" in sec_name or "Latest Vitals:" in line or "BP:" in line:
+                vitals_match = re.search(r'BP:\s*([^,]+),\s*Pulse:\s*([^,]+),\s*Temp:\s*([^,]+),\s*SpO2:\s*([^\.]+)', line)
+                if vitals_match:
+                    bp, pulse, temp, spo2 = vitals_match.groups()
+                    categorized_facts["observations"].append((f"Blood pressure: {bp.strip()}", ref_id, chunk_score))
+                    categorized_facts["observations"].append((f"Pulse: {pulse.strip()}", ref_id, chunk_score))
+                    categorized_facts["observations"].append((f"Temperature: {temp.strip()}", ref_id, chunk_score))
+                    categorized_facts["observations"].append((f"SpO2: {spo2.strip()}", ref_id, chunk_score))
+
+                notes_match = re.search(r'Notes:\s*(.*)', line)
+                if notes_match:
+                    notes_text = notes_match.group(1).strip()
+                    for n_sent in re.split(r'(?<=[.!?])\s+', notes_text):
+                        n_clean = n_sent.strip().rstrip(".")
+                        if n_clean:
+                            categorized_facts["observations"].append((n_clean, ref_id, chunk_score))
+                elif not vitals_match:
+                    categorized_facts["observations"].append((clean, ref_id, chunk_score))
+
+            elif "INVESTIGATION" in sec_name or "LAB" in sec_name or "RADIOLOGY" in sec_name or "Hemoglobin:" in line or "CBC" in line:
+                if "Radiology:" in line:
+                    rad_parts = line.split("Radiology:")
+                    lab_part = clean_clinical_text(rad_parts[0])
+                    rad_part = clean_clinical_text(rad_parts[1])
+                    if lab_part:
+                        categorized_facts["investigations"].append((lab_part, ref_id, chunk_score))
+                    if rad_part:
+                        categorized_facts["investigations"].append((f"Radiology: {rad_part}", ref_id, chunk_score))
+                else:
+                    categorized_facts["investigations"].append((clean, ref_id, chunk_score))
+
+            elif "ASSESSMENT" in sec_name or "DIAGNOSIS" in sec_name or "Assessment:" in line:
+                categorized_facts["assessment"].append((clean, ref_id, chunk_score))
+
+            elif "RECOMMENDATION" in sec_name or "TREATMENT" in sec_name or "ANTIMICROBIAL" in sec_name:
+                if re.search(r'^\d+\.\s+', clean):
+                    for item in re.split(r'(?=\b\d+\.\s+)', clean):
+                        it_clean = clean_clinical_text(item).rstrip(".")
+                        if it_clean:
+                            categorized_facts["treatment"].append((it_clean, ref_id, chunk_score))
+                else:
+                    for item in re.split(r'(?=\s*-\s+[A-Za-z])', clean):
+                        it_clean = clean_clinical_text(item).rstrip(".")
+                        if it_clean:
+                            categorized_facts["treatment"].append((it_clean, ref_id, chunk_score))
+
+            elif "CHIEF COMPLAINT" in sec_name or "CLINICAL HISTORY" in sec_name:
+                categorized_facts["complaint"].append((clean, ref_id, chunk_score))
+
+            else:
+                # Guideline protocol or generic text
+                for s in re.split(r'(?<=[.!?])\s+', clean):
+                    s_clean = clean_clinical_text(s)
+                    if len(s_clean) > 8:
+                        categorized_facts["guideline_statements"].append((s_clean, ref_id, chunk_score))
+
+    # 2. Assemble focused answer according to query intent
+    result_blocks = []
+
+    # CASE 0: Comparative / Historical Query across multiple reports
+    is_historical = is_historical_patient_query(query)
+    distinct_reports = {}
+    for idx, c in enumerate(retrieved_chunks):
+        rep_name = c.get("pdf_name", "Clinical Report")
+        if rep_name not in distinct_reports:
+            distinct_reports[rep_name] = []
+        distinct_reports[rep_name].append((idx + 1, c))
+
+    if is_historical and len(distinct_reports) > 1 and not is_general_summary:
+        comp_blocks = ["### Clinical Report Comparison\n"]
+        for rep_name, c_list in distinct_reports.items():
+            m_rep = re.search(r'Report(\d+)', rep_name)
+            rep_label = f"Report {m_rep.group(1)}" if m_rep else rep_name
+            lines = [f"#### {rep_label}"]
+            seen = set()
+            for ref_id, chunk in c_list:
+                c_text = chunk.get("text", "")
+                for raw_line in c_text.split("\n"):
+                    clean = clean_clinical_text(raw_line)
+                    if not clean or len(clean) < 4 or any(clean.upper().startswith(p) for p in ["REPORT ID", "STATUS", "PATIENT ID", "CREATED"]):
+                        continue
+                    norm = clean.lower()
+                    if norm in seen:
+                        continue
+                    seen.add(norm)
+                    if has_vitals_intent and any(k in norm for k in ["blood pressure", "bp:", "pulse:", "temp:", "spo2:", "vitals"]):
+                        v_match = re.match(r'^(Blood pressure|Pulse|Temperature|SpO2|Notes):\s*(.*)', clean, re.IGNORECASE)
+                        if v_match:
+                            lines.append(f"- **{v_match.group(1)}:** {v_match.group(2)} [{ref_id}]")
+                        else:
+                            lines.append(f"- {clean} [{ref_id}]")
+                    elif has_treatment_intent and any(k in norm for k in ["mg", "daily", "therapy", "antimicrobial", "ceftriaxone", "treatment", "monitor"]):
+                        lines.append(f"- {clean} [{ref_id}]")
+                    elif has_assessment_intent and any(k in norm for k in ["diagnosis", "assessment", "acute", "pneumonia"]):
+                        lines.append(f"- {clean} [{ref_id}]")
+                    elif not (has_vitals_intent or has_treatment_intent or has_assessment_intent or has_labs_intent):
+                        lines.append(f"- {clean} [{ref_id}]")
+            if len(lines) > 1:
+                comp_blocks.append("\n".join(lines[:6]))
+        if len(comp_blocks) > 1:
+            result_blocks.append("\n\n".join(comp_blocks))
+
+    # CASE 1: Query specifically asks about Observations & Vitals
+    if not result_blocks and has_vitals_intent and not is_general_summary:
+        obs_list = categorized_facts["observations"]
+        if obs_list:
+            seen = set()
+            lines = ["### Observations & Vital Signs\n"]
+            for item, ref_id, _ in obs_list:
+                norm = item.lower()
+                if norm not in seen:
+                    seen.add(norm)
+                    v_match = re.match(r'^(Blood pressure|Pulse|Temperature|SpO2|Notes|Radiology|Hemoglobin|WBC|Platelets|Creatinine|CRP):\s*(.*)', item, re.IGNORECASE)
+                    if v_match:
+                        lines.append(f"- **{v_match.group(1)}:** {v_match.group(2)} [{ref_id}]")
+                    else:
+                        lines.append(f"- {item} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+
+    # CASE 2: Query specifically asks about Labs / Investigations / Radiology
+    elif not result_blocks and has_labs_intent and not is_general_summary:
+        inv_list = categorized_facts["investigations"]
+        if inv_list:
+            seen = set()
+            lines = ["### Investigations & Diagnostic Findings\n"]
+            for item, ref_id, _ in inv_list:
+                norm = item.lower()
+                if norm not in seen:
+                    seen.add(norm)
+                    v_match = re.match(r'^(Blood pressure|Pulse|Temperature|SpO2|Notes|Radiology|Hemoglobin|WBC|Platelets|Creatinine|CRP):\s*(.*)', item, re.IGNORECASE)
+                    if v_match:
+                        lines.append(f"- **{v_match.group(1)}:** {v_match.group(2)} [{ref_id}]")
+                    else:
+                        lines.append(f"- {item} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+
+    # CASE 3: Query specifically asks about Assessment / Diagnosis
+    elif not result_blocks and has_assessment_intent and not is_general_summary:
+        ass_list = categorized_facts["assessment"]
+        if ass_list:
+            seen = set()
+            lines = ["### Clinical Assessment & Diagnosis\n"]
+            for item, ref_id, _ in ass_list:
+                norm = item.lower()
+                if norm not in seen:
+                    seen.add(norm)
+                    lines.append(f"- {item} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+
+    # CASE 4: Query specifically asks about Treatment / Recommendations / Antimicrobial Guidelines
+    elif not result_blocks and has_treatment_intent and not is_general_summary:
+        tx_list = categorized_facts["treatment"] + [
+            (s, r, sc) for s, r, sc in categorized_facts["guideline_statements"]
+            if any(w in s.lower() for w in ["therapy", "dose", "antimicrobial", "ceftriaxone", "amoxicillin", "mg", "daily", "admission", "icu", "discharge"])
+        ]
+        if tx_list:
+            scored_tx = []
+            seen = set()
+            for item, ref_id, chunk_sc in tx_list:
+                norm = item.lower()
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                item_words = set(re.findall(r'\w+', norm))
+                overlap = len(q_words.intersection(item_words))
+                if "severe" in q_lower and ("severe" in norm or "icu" in norm):
+                    overlap += 3
+                if "outpatient" in q_lower and "outpatient" in norm:
+                    overlap += 3
+                if "inpatient" in q_lower and "inpatient" in norm:
+                    overlap += 2
+                scored_tx.append((overlap, chunk_sc, item, ref_id))
+
+            scored_tx.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            lines = ["### Treatment Recommendations & Guidelines\n"]
+            for _, _, item, ref_id in scored_tx[:4]:
+                lines.append(f"- {item} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+
+    # CASE 5: General Summary of patient or report
+    elif not result_blocks and is_general_summary:
+        summary_blocks = []
+        header_lines = ["### Clinical Patient Report\n"]
+        meta_lines = []
+        if "name" in patient_info:
+            meta_lines.append(f"**Patient:** {patient_info['name']}  ")
+        if "age" in patient_info:
+            meta_lines.append(f"**Age:** {patient_info['age']}  ")
+        if "gender" in patient_info:
+            meta_lines.append(f"**Gender:** {patient_info['gender']}  ")
+        if "dept" in patient_info:
+            meta_lines.append(f"**Department:** {patient_info['dept']}  ")
+        if meta_lines:
+            header_lines.append("\n".join(meta_lines) + "\n")
+        summary_blocks.append("".join(header_lines).strip())
+
+        if categorized_facts["complaint"]:
+            lines = ["#### Chief Complaint & History"]
+            for item, ref_id, _ in categorized_facts["complaint"][:2]:
+                lines.append(f"- {item} [{ref_id}]")
+            summary_blocks.append("\n".join(lines))
+
+        if categorized_facts["observations"]:
+            lines = ["#### Observations & Vital Signs"]
+            seen = set()
+            obs_items = []
+            for item, ref_id, _ in categorized_facts["observations"][:6]:
+                norm = item.lower()
+                if norm not in seen:
+                    seen.add(norm)
+                    v_match = re.match(r'^(Blood pressure|Pulse|Temperature|SpO2):\s*(.*)', item, re.IGNORECASE)
+                    if v_match:
+                        obs_items.append(f"- **{v_match.group(1)}:** {v_match.group(2)} [{ref_id}]")
+                    else:
+                        obs_items.append(f"- {item} [{ref_id}]")
+            if obs_items:
+                lines.extend(obs_items)
+            summary_blocks.append("\n".join(lines))
+
+        if categorized_facts["investigations"]:
+            lines = ["#### Investigations & Diagnostics"]
+            seen = set()
+            inv_items = []
+            for item, ref_id, _ in categorized_facts["investigations"][:3]:
+                norm = item.lower()
+                if norm not in seen:
+                    seen.add(norm)
+                    if "radiology:" in norm:
+                        inv_items.append(f"- **Radiology:** {re.sub(r'^radiology:\s*', '', item, flags=re.IGNORECASE)} [{ref_id}]")
+                    else:
+                        inv_items.append(f"- **Laboratory Panel:** {item} [{ref_id}]")
+            if inv_items:
+                lines.extend(inv_items)
+            summary_blocks.append("\n".join(lines))
+
+        if categorized_facts["assessment"]:
+            lines = ["#### Clinical Assessment"]
+            for item, ref_id, _ in categorized_facts["assessment"][:2]:
+                lines.append(f"- {item} [{ref_id}]")
+            summary_blocks.append("\n".join(lines))
+
+        if categorized_facts["treatment"]:
+            lines = ["#### Recommendations & Treatment Plan"]
+            for item, ref_id, _ in categorized_facts["treatment"][:3]:
+                lines.append(f"- {item} [{ref_id}]")
+            summary_blocks.append("\n".join(lines))
+
+        result_blocks.append("\n\n".join(summary_blocks))
+
+    # CASE 6: Specific Question / Guidelines Question (fallback across all sentences)
+    if not result_blocks:
+        all_candidates = []
+        for idx, chunk in enumerate(retrieved_chunks):
+            ref_id = idx + 1
+            chunk_sc = chunk.get("rerank_score", chunk.get("dense_score", 1.0 / (idx + 1)))
+            text = chunk.get("text", "")
+            for raw_line in text.split("\n"):
+                clean = clean_clinical_text(raw_line)
+                if not clean or len(clean) < 10:
+                    continue
+                for sent in re.split(r'(?<=[.!?])\s+', clean):
+                    s_clean = sent.strip().rstrip(".")
+                    if len(s_clean) < 10:
+                        continue
+                    # Remove any leftover journal / web artifacts
+                    s_clean = re.sub(r'(?:www\.[a-z0-9\-]+\.[a-z]+|http[s]?://\S+|©\s*\d{4}|\bISSN:\s*[0-9\-]+|\bVolume\s+\d+|\bIJCRT\w*)', '', s_clean, flags=re.IGNORECASE).strip(' -–—|:,')
+                    if len(s_clean) < 10:
+                        continue
+                    s_words = set(re.findall(r'\w+', s_clean.lower()))
+                    overlap = len(q_words.intersection(s_words))
+                    all_candidates.append((overlap, chunk_sc, s_clean, ref_id))
+
+        all_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        # Deduplicate candidates while preserving order
+        unique_candidates = []
+        seen_sents = set()
+        for overlap, chunk_sc, s_text, ref_id in all_candidates:
+            norm = re.sub(r'[^a-z0-9]', '', s_text.lower())
+            if not norm or any(norm in seen or seen in norm for seen in seen_sents):
+                continue
+            seen_sents.add(norm)
+            unique_candidates.append((overlap, chunk_sc, s_text, ref_id))
+
+        # Determine section header
+        if any(w in q_lower for w in ["step", "steps", "cpr", "procedure", "how to", "manage", "management", "action", "emergency", "cardiac"]):
+            header_title = "### Clinical Guidance & Protocol\n"
+        else:
+            first_sec = retrieved_chunks[0].get("section")
+            if first_sec and first_sec.lower() not in ["none", "general", "general overview", "details"]:
+                header_title = f"### {first_sec.title()}\n"
+            else:
+                header_title = "### Clinical Evidence & Guidance\n"
+
+        lines = [header_title]
+        if unique_candidates and unique_candidates[0][0] > 0:
+            for _, _, s_text, ref_id in unique_candidates[:4]:
+                lines.append(f"- {s_text} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+        elif unique_candidates:
+            for _, _, s_text, ref_id in unique_candidates[:3]:
+                lines.append(f"- {s_text} [{ref_id}]")
+            result_blocks.append("\n".join(lines))
+        else:
+            first_chunk = retrieved_chunks[0]
+            clean_first = clean_clinical_text(first_chunk.get('text', ''))
+            first_sent = re.split(r'(?<=[.!?])\s+', clean_first)[0] if clean_first else "Clinical protocol documented."
+            result_blocks.append(f"### Clinical Guidance\n\n- {first_sent} [1]")
+
+    return "\n\n".join(result_blocks)
 
 
 def query_pipeline(
@@ -424,7 +873,8 @@ def query_pipeline(
     filters: Optional[Dict[str, Any]] = None,
     direct_llm: bool = False,
     user_role: str = "DOCTOR",
-    active_doc_ids: Optional[Set[int]] = None
+    active_doc_ids: Optional[Set[int]] = None,
+    db: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes the full Multi-RAG pipeline:
@@ -443,10 +893,57 @@ def query_pipeline(
     13. NLI Sentence-Level Fact Verification
     14. Permission-Aware Citation Formatting
     """
+    # 1. DIRECT LLM Mode — Genuinely bypasses FAISS, BM25, RRF, Reranker, NLI, and Citations
+    if direct_llm:
+        answer = ""
+        using_mock = False
+
+        if GROQ_API_KEY:
+            try:
+                answer = call_groq_llm(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
+            except Exception as e_groq:
+                gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if gemini_key:
+                    try:
+                        answer = call_gemini_fallback(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
+                    except Exception:
+                        answer = "Direct LLM response: Unable to contact LLM provider. Please check network or API configuration."
+                        using_mock = True
+                else:
+                    answer = f"Direct LLM Error: {str(e_groq)}"
+                    using_mock = True
+        else:
+            gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if gemini_key:
+                try:
+                    answer = call_gemini_fallback(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
+                except Exception:
+                    answer = "Direct LLM Mode: External API unavailable."
+                    using_mock = True
+            else:
+                answer = "Direct LLM Mode: No API keys configured. LLM generation unavailable."
+                using_mock = True
+
+        return {
+            "answer": answer.strip() if answer else "",
+            "confidence_level": None,
+            "confidence_score": None,
+            "grounding_level": None,
+            "grounding_coverage": "",
+            "supported_claims": 0,
+            "total_claims": 0,
+            "evidence": [],
+            "verification_results": [],
+            "using_mock": using_mock,
+            "grounded": False,
+            "citations": [],
+            "retrieval": {}
+        }
+
     t0 = time.time()
     index, metadata, embeddings_array = get_vector_store()
 
-    if len(metadata) == 0 and not direct_llm:
+    if len(metadata) == 0:
         return {
             "answer": "No active clinical documents have been indexed in the system yet. Please upload hospital guidelines to enable Retrieval-Augmented Generation.",
             "confidence_level": "Low",
@@ -457,60 +954,7 @@ def query_pipeline(
             "total_claims": 0,
             "evidence": [],
             "verification_results": [],
-            "grounded": False,
-            "citations": []
-        }
-
-    # DIRECT LLM Mode
-    if direct_llm:
-        prompt = f"""You are a clinical decision support assistant. Answer the medical question directly using general clinical knowledge.
-IMPORTANT: Clearly label your answer as a direct unverified LLM response.
-
-USER QUESTION:
-{query}
-
-CLINICAL RESPONSE (DIRECT LLM):"""
-
-        answer = ""
-        using_mock = False
-
-        if GROQ_API_KEY:
-            try:
-                answer = call_groq_llm(prompt)
-            except Exception:
-                gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-                if gemini_key:
-                    try:
-                        answer = call_gemini_fallback(prompt)
-                    except Exception:
-                        answer = "Direct LLM Mode: External APIs unavailable."
-                        using_mock = True
-                else:
-                    answer = "Direct LLM Mode: External APIs unavailable."
-                    using_mock = True
-        else:
-            gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            if gemini_key:
-                try:
-                    answer = call_gemini_fallback(prompt)
-                except Exception:
-                    answer = "Direct LLM Mode: External API unavailable."
-                    using_mock = True
-            else:
-                answer = "Direct LLM Mode: No API keys configured. LLM generation unavailable."
-                using_mock = True
-
-        return {
-            "answer": answer,
-            "confidence_level": "High" if not using_mock else "Low",
-            "confidence_score": 1.0 if not using_mock else 0.0,
-            "grounding_level": "Not Supported" if using_mock else "Partially Supported",
-            "grounding_coverage": "Unverified direct LLM response",
-            "supported_claims": 0,
-            "total_claims": 0,
-            "evidence": [],
-            "verification_results": [],
-            "using_mock": using_mock,
+            "using_mock": False,
             "grounded": False,
             "citations": []
         }
@@ -527,11 +971,36 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     bm25_weight = routing_decision["bm25_weight"]
 
     # 4. Scope & Document Status Filtering
+    patient_id_filter = (filters.get("patient_id") if filters else None) or clinical_entities.get("patient_id")
+    is_historical = is_historical_patient_query(query)
+
+    latest_report_id = None
+    allowed_report_ids = set()
+    if patient_id_filter:
+        active_reports = get_patient_active_reports(patient_id_filter, db)
+        if active_reports:
+            latest_report_id = active_reports[0].id
+            allowed_report_ids = {r.id for r in active_reports}
+
     filtered_chunks_with_indices: List[Tuple[int, Dict[str, Any]]] = []
     for idx, chunk in enumerate(metadata):
         doc_id = chunk.get("document_id")
         if active_doc_ids is not None and doc_id is not None and doc_id not in active_doc_ids:
             continue
+
+        chunk_patient_id = chunk.get("patient_id")
+        chunk_report_id = chunk.get("report_id")
+        chunk_pdf_name = chunk.get("pdf_name", "")
+        if chunk_report_id is None and "Report" in chunk_pdf_name:
+            m_rep = re.search(r'Report(\d+)', chunk_pdf_name)
+            if m_rep:
+                chunk_report_id = int(m_rep.group(1))
+
+        is_clinical_rep = (
+            chunk_report_id is not None
+            or chunk.get("document_type") == "clinical_report"
+            or "Clinical_Report_" in chunk_pdf_name
+        )
 
         match = True
         if filters:
@@ -540,19 +1009,27 @@ CLINICAL RESPONSE (DIRECT LLM):"""
                 if chunk.get("scope") != "knowledge_base":
                     match = False
             elif scope == "patient":
-                patient_id = filters.get("patient_id")
-                if chunk.get("scope") != "patient" or chunk.get("patient_id") != patient_id:
+                if chunk.get("scope") != "patient" or chunk_patient_id != patient_id_filter:
                     match = False
+                elif is_clinical_rep:
+                    if chunk_report_id is not None and chunk_report_id not in allowed_report_ids and allowed_report_ids:
+                        match = False
+                    elif not is_historical and latest_report_id is not None and chunk_report_id != latest_report_id:
+                        match = False
             elif scope == "temporary":
                 doc_id_filter = filters.get("document_id")
                 if str(chunk.get("document_id")) != str(doc_id_filter):
                     match = False
             elif scope == "patient_and_kb":
-                patient_id = filters.get("patient_id")
                 is_kb = chunk.get("scope") == "knowledge_base"
-                is_patient = chunk.get("scope") == "patient" and chunk.get("patient_id") == patient_id
+                is_patient = chunk.get("scope") == "patient" and chunk_patient_id == patient_id_filter
                 if not (is_kb or is_patient):
                     match = False
+                elif is_patient and is_clinical_rep:
+                    if chunk_report_id is not None and chunk_report_id not in allowed_report_ids and allowed_report_ids:
+                        match = False
+                    elif not is_historical and latest_report_id is not None and chunk_report_id != latest_report_id:
+                        match = False
 
         if match:
             filtered_chunks_with_indices.append((idx, chunk))
@@ -654,7 +1131,7 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     is_insufficient = False
     if not top_chunks:
         is_insufficient = True
-    elif max_raw_rerank < -3.0 or max_rerank_score < 0.15:
+    elif max_raw_rerank < -3.0:
         # Cross-encoder evaluated all candidate passages as completely non-matching (< -3.0 logits)
         is_insufficient = True
     elif max_dense_score < RAG_INSUFFICIENT_EVIDENCE_THRESHOLD and max_bm25_score < 1.0:
@@ -676,6 +1153,7 @@ CLINICAL RESPONSE (DIRECT LLM):"""
             "total_claims": 0,
             "evidence": [],
             "verification_results": [],
+            "using_mock": False,
             "grounded": False,
             "citations": [],
             "retrieval": {
@@ -727,14 +1205,16 @@ CLINICAL RESPONSE (DIRECT LLM):"""
     prompt = f"""Use the following verified hospital evidence passages to answer the clinician's query.
 
 STRICT CLINICAL GROUNDING DIRECTIVES:
-1. Answer the clinical question using ONLY the supplied retrieved evidence passages.
-2. Do NOT use outside medical knowledge, conjecture, or unverified treatments.
-3. Do NOT invent facts, diagnoses, dosages, treatments, clinical values, or recommendations.
-4. Paraphrasing is allowed IF AND ONLY IF the clinical meaning is preserved and fully supported.
-5. If the retrieved evidence does not adequately answer the question, return verbatim:
+1. Answer the clinical question directly, cleanly, and concisely using ONLY the supplied retrieved evidence passages.
+2. Address ONLY the specific clinical dimension or question asked (e.g., if asked about observations/vitals, return ONLY the observations and vital signs; if asked about treatment, return ONLY treatment recommendations; do NOT prepend or append unrelated report sections).
+3. Do NOT include raw report metadata, header banners, "REPORT ID", "STATUS", "PATIENT ID", "CREATED", or chunk IDs in your answer text.
+4. If comparing multiple reports or past timeline, clearly organize findings under chronological report headers (e.g., #### Report X).
+5. Do NOT use outside medical knowledge, conjecture, or unverified treatments.
+6. Do NOT invent facts, diagnoses, dosages, treatments, clinical values, or recommendations.
+7. Paraphrasing is allowed IF AND ONLY IF the clinical meaning is preserved and fully supported.
+8. If the retrieved evidence does not adequately answer the question, return verbatim:
 "Insufficient evidence in the hospital knowledge base to answer this question reliably."
-6. Do NOT guess or fill in missing clinical information.
-7. Annotate medical claims with their corresponding bracketed source reference, e.g., [1], [2].
+9. Annotate medical claims with their corresponding bracketed source reference, e.g., [1], [2].
 
 ---
 RETRIEVED HOSPITAL EVIDENCE PASSAGES:

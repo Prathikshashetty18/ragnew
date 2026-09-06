@@ -41,8 +41,12 @@ export interface PatientVitals {
   id: number;
   blood_pressure?: string;
   pulse?: number;
+  respiratory_rate?: number;
   temperature?: number;
   spo2?: number;
+  blood_glucose?: number;
+  pain_score?: number;
+  intake_output?: string;
   notes?: string;
   recorded_by?: string;
   timestamp: string;
@@ -104,10 +108,12 @@ export interface ClinicalReport {
 
 export interface SourceCard {
   document_id: string;
+  citation_id?: number;
   title: string;
   type?: string;
   page?: number;
   section?: string;
+  subsection?: string;
   relevance: number;
   view_url?: string;
   supporting_text?: string;

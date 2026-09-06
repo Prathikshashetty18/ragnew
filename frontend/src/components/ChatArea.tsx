@@ -1,15 +1,17 @@
 import React, { useState, useRef, useEffect } from "react";
 import {
-  Send, Paperclip, Mic, MicOff,
+  Send, Paperclip, Mic, MicOff, Square,
   FileText, ExternalLink, Sparkles, User as UserIcon, Bot,
   FileSearch
 } from "lucide-react";
 import { ConfidencePill } from "./ConfidencePill";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 import type { ChatMessage, Patient, SourceCard } from "../types";
 
 interface ChatAreaProps {
   messages: ChatMessage[];
   onSendMessage: (query: string, directLlm: boolean, attachedDocId?: number) => void;
+  onStopGeneration?: () => void;
   isLoading: boolean;
   patients: Patient[];
   selectedPatientId: string | null;
@@ -19,6 +21,7 @@ interface ChatAreaProps {
 export const ChatArea: React.FC<ChatAreaProps> = ({
   messages,
   onSendMessage,
+  onStopGeneration,
   isLoading,
   patients,
   selectedPatientId,
@@ -38,8 +41,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     // Auto-update right panel sources from last message if present
     const lastMsg = messages[messages.length - 1];
-    if (lastMsg && lastMsg.role === "assistant" && lastMsg.sources && lastMsg.sources.length > 0) {
-      setSelectedSources(lastMsg.sources);
+    if (lastMsg && lastMsg.role === "assistant") {
+      if (lastMsg.sources && lastMsg.sources.length > 0) {
+        setSelectedSources(lastMsg.sources);
+      } else {
+        setSelectedSources([]);
+      }
     }
   }, [messages]);
 
@@ -81,6 +88,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }
   };
 
+  const handleDetachPdf = async () => {
+    if (!attachedPdf) return;
+    const docId = attachedPdf.id;
+    setAttachedPdf(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    try {
+      await fetch(`http://127.0.0.1:8000/api/chat/attachments/${docId}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+      });
+    } catch (e) {
+      console.error("Error detaching temporary attachment:", e);
+    }
+  };
+
+  const recognitionRef = useRef<any>(null);
+
   const toggleVoiceInput = () => {
     if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
       alert("Speech recognition is not supported in this browser.");
@@ -88,6 +116,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }
 
     if (isRecording) {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (e) {}
+        recognitionRef.current = null;
+      }
       setIsRecording(false);
       return;
     }
@@ -97,17 +131,29 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = "en-US";
+    recognitionRef.current = recognition;
 
     recognition.onstart = () => setIsRecording(true);
-    recognition.onend = () => setIsRecording(false);
-    recognition.onerror = () => setIsRecording(false);
+    recognition.onend = () => {
+      setIsRecording(false);
+      recognitionRef.current = null;
+    };
+    recognition.onerror = () => {
+      setIsRecording(false);
+      recognitionRef.current = null;
+    };
 
     recognition.onresult = (event: any) => {
       const transcript = event.results[0][0].transcript;
       setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
     };
 
-    recognition.start();
+    try {
+      recognition.start();
+    } catch (e) {
+      setIsRecording(false);
+      recognitionRef.current = null;
+    }
   };
 
   const selectedPatient = patients.find((p) => p.id === selectedPatientId);
@@ -169,8 +215,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <span>Session PDF Attached: <strong>{attachedPdf.name}</strong> (Queries strictly isolated to this file)</span>
             </div>
             <button
-              onClick={() => setAttachedPdf(null)}
-              className="text-rose-800 hover:text-rose-950 text-xs font-semibold underline"
+              onClick={handleDetachPdf}
+              className="text-rose-800 hover:text-rose-950 text-xs font-semibold underline cursor-pointer"
             >
               Detach
             </button>
@@ -207,23 +253,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             messages.map((m) => {
               const isUser = m.role === "user";
               return (
-                <div key={m.id} className={`flex gap-3.5 ${isUser ? "justify-end" : "justify-start"}`}>
+                <div key={m.id} className={`flex gap-3 w-full ${isUser ? "justify-end" : "justify-start"}`}>
                   {!isUser && (
-                    <div className="w-8 h-8 rounded-xl bg-rose-900 flex items-center justify-center text-white shrink-0 shadow-sm mt-0.5">
+                    <div className="w-8 h-8 rounded-xl bg-rose-900 flex items-center justify-center text-white shrink-0 shadow-xs mt-1">
                       <Bot className="w-4 h-4" />
                     </div>
                   )}
 
-                  <div className={`max-w-[80%] rounded-2xl p-4 text-sm leading-relaxed ${
+                  <div className={`${
                     isUser
-                      ? "bg-rose-900 text-white rounded-tr-none shadow-sm"
-                      : "bg-white border border-slate-200 text-slate-900 rounded-tl-none shadow-sm"
+                      ? "max-w-[75%] sm:max-w-md md:max-w-lg lg:max-w-xl bg-rose-900 text-white rounded-2xl rounded-tr-sm px-4 py-3 shadow-xs text-sm font-medium leading-relaxed"
+                      : "w-full max-w-4xl lg:max-w-5xl bg-white border border-slate-200/90 rounded-2xl rounded-tl-sm p-6 md:p-7 shadow-xs text-slate-900 text-[14px] leading-relaxed space-y-4"
                   }`}>
-                    {/* Metadata Header for Assistant */}
+                    {/* Metadata Header for Assistant (Strict RAG mode only) */}
                     {!isUser && (
-                      <div className="flex items-center justify-between gap-4 pb-2.5 mb-2.5 border-b border-slate-100 text-xs">
+                      (m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level)) ||
+                      (m.sources && m.sources.length > 0)
+                    ) && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-1 border-b border-slate-100 text-xs">
                         <div className="flex items-center gap-2">
-                          {(m.confidence_level || m.confidence_score !== undefined) && (
+                          <span className="font-bold text-slate-800 text-xs">Clinical Decision Assistant</span>
+                          {m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level) && (
                             <ConfidencePill
                               level={m.confidence_level}
                               score={m.confidence_score}
@@ -233,24 +283,29 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
                         {m.sources && m.sources.length > 0 && (
                           <button
+                            type="button"
                             onClick={() => setSelectedSources(m.sources || [])}
-                            className="text-[11px] font-semibold text-rose-900 hover:text-rose-700 flex items-center gap-1 underline"
+                            className="text-[11px] font-semibold text-rose-900 hover:text-rose-700 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100/80 border border-rose-200/70 transition-colors cursor-pointer"
                           >
                             <FileSearch className="w-3.5 h-3.5" />
-                            {m.sources.length} Sources
+                            <span>{m.sources.length} Sources Cited</span>
                           </button>
                         )}
                       </div>
                     )}
 
-                    {/* Markdown / Text Content with High-Contrast Text */}
-                    <div className="prose prose-sm max-w-none text-slate-900 whitespace-pre-wrap font-normal">
-                      {m.content}
-                    </div>
+                    {/* Message Body with Markdown Rendering */}
+                    {isUser ? (
+                      <div className="whitespace-pre-wrap">{m.content}</div>
+                    ) : (
+                      <div className="text-slate-850 text-[14px] leading-relaxed">
+                        <MarkdownRenderer content={m.content} />
+                      </div>
+                    )}
                   </div>
 
                   {isUser && (
-                    <div className="w-8 h-8 rounded-xl bg-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-0.5">
+                    <div className="w-8 h-8 rounded-xl bg-slate-200 flex items-center justify-center text-slate-700 shrink-0 mt-1 shadow-2xs">
                       <UserIcon className="w-4 h-4" />
                     </div>
                   )}
@@ -314,13 +369,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               className="flex-1 py-3 px-4 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-800 focus:bg-white transition"
             />
 
-            <button
-              type="submit"
-              disabled={!input.trim() || isLoading}
-              className="p-3 bg-rose-900 hover:bg-rose-800 text-white rounded-xl shadow-md shadow-rose-950/20 transition disabled:opacity-40"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={onStopGeneration}
+                title="Stop generation"
+                className="p-3 bg-red-600 hover:bg-red-700 text-white rounded-xl shadow-md transition flex items-center justify-center cursor-pointer"
+              >
+                <Square className="w-4 h-4 fill-current" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="p-3 bg-rose-900 hover:bg-rose-800 text-white rounded-xl shadow-md shadow-rose-950/20 transition disabled:opacity-40"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            )}
           </form>
         </div>
       </div>
@@ -343,41 +409,52 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           </div>
         ) : (
           <div className="space-y-3">
-            {selectedSources.map((src, idx) => (
-              <div
-                key={idx}
-                className="p-3.5 bg-white rounded-xl border border-slate-200 shadow-sm hover:border-rose-300 transition"
-              >
-                <div className="flex items-start justify-between gap-2 mb-1.5">
-                  <h4 className="text-xs font-bold text-slate-900 leading-snug">{src.title}</h4>
-                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-50 text-rose-900 border border-rose-200 shrink-0">
-                    Pg {src.page || 1}
-                  </span>
+            {selectedSources.map((src, idx) => {
+              const citationId = src.citation_id || idx + 1;
+              return (
+                <div
+                  key={idx}
+                  className="p-3.5 bg-white rounded-xl border border-slate-200 shadow-xs hover:border-rose-300 transition"
+                >
+                  <div className="flex items-start justify-between gap-2 mb-1.5">
+                    <div className="flex items-start gap-1.5 min-w-0">
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold font-mono bg-rose-50 text-rose-900 border border-rose-200 shrink-0">
+                        [{citationId}]
+                      </span>
+                      <h4 className="text-xs font-bold text-slate-900 leading-snug break-words">{src.title}</h4>
+                    </div>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 shrink-0">
+                      Pg {src.page || 1}
+                    </span>
+                  </div>
+
+                  <div className="text-[11px] text-slate-500 font-medium mb-2 flex items-center gap-1.5">
+                    <span>Section:</span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100/70 border border-slate-200/80 font-semibold text-slate-800 text-[10px]">
+                      {src.section || "Clinical Assessment"}
+                    </span>
+                  </div>
+
+                  {src.supporting_text && (
+                    <p className="text-[11px] text-slate-600 bg-slate-50 p-2.5 rounded-lg border border-slate-150 leading-relaxed mb-2.5 line-clamp-4">
+                      "{src.supporting_text}"
+                    </p>
+                  )}
+
+                  {src.view_url && (
+                    <a
+                      href={`http://127.0.0.1:8000${src.view_url}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-900 hover:text-rose-700"
+                    >
+                      <span>Open Verified Source</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
                 </div>
-
-                <div className="text-[11px] text-slate-500 font-medium mb-2">
-                  Section: <span className="text-slate-700">{src.section || "Clinical Assessment"}</span>
-                </div>
-
-                {src.supporting_text && (
-                  <p className="text-[11px] text-slate-600 bg-slate-50 p-2 rounded-lg border border-slate-100 leading-relaxed mb-2.5 line-clamp-3">
-                    "{src.supporting_text}"
-                  </p>
-                )}
-
-                {src.view_url && (
-                  <a
-                    href={`http://127.0.0.1:8000${src.view_url}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-900 hover:text-rose-700"
-                  >
-                    <span>Open Verified Source</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

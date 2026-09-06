@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Upload, CheckCircle, Check, Archive } from "lucide-react";
+import { Upload, CheckCircle, Check, Archive, Trash2 } from "lucide-react";
 import type { DocumentItem, User } from "../types";
 
 interface KnowledgeBaseViewProps {
@@ -93,6 +93,24 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
       }
     } catch (e) {
       alert("Archive failed.");
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (!window.confirm("Are you sure you want to permanently delete this document and remove all associated indexed chunks?")) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/documents/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        fetchDocs();
+      } else {
+        const data = await res.json();
+        alert(data.detail || "Delete failed.");
+      }
+    } catch (e) {
+      alert("Delete failed.");
     }
   };
 
@@ -208,7 +226,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
                       {d.approval_status === "PENDING" && (
                         <button
                           onClick={() => handleApprove(d.id)}
-                          className="p-1 text-emerald-700 hover:bg-emerald-50 rounded"
+                          className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded transition"
                           title="Approve and Index"
                         >
                           <Check className="w-4 h-4" />
@@ -217,12 +235,19 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
                       {d.approval_status === "ACTIVE" && (
                         <button
                           onClick={() => handleArchive(d.id)}
-                          className="p-1 text-slate-500 hover:text-rose-700 rounded"
+                          className="p-1.5 text-slate-500 hover:text-amber-700 rounded transition"
                           title="Archive from Vector Store"
                         >
                           <Archive className="w-4 h-4" />
                         </button>
                       )}
+                      <button
+                        onClick={() => handleDelete(d.id)}
+                        className="p-1.5 text-slate-400 hover:text-rose-700 rounded transition"
+                        title="Permanently Delete Document & Chunks"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </td>
                   )}
                 </tr>

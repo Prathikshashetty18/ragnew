@@ -1,10 +1,13 @@
 import os
 import re
+import uuid
 import shutil
 import random
 from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query
+from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -16,8 +19,8 @@ from app.database import (
     TrustedSource, AuditLog
 )
 from app.auth import (
-    hash_password, verify_password, create_access_token, get_current_user, 
-    require_roles, log_audit_event
+    hash_password, verify_password, create_access_token, decode_access_token,
+    get_current_user, require_roles, log_audit_event, security_bearer
 )
 from app.document_validator import (
     validate_pdf_structure, evaluate_medical_relevance, 
@@ -26,7 +29,7 @@ from app.document_validator import (
 from app.rag_pipeline import (
     process_pdf, query_pipeline, remove_document_from_vector_store
 )
-from app.report_generator import generate_ai_patient_report, sync_report_to_knowledge_base
+from app.report_generator import generate_ai_patient_report, sync_report_to_knowledge_base, reconcile_unindexed_clinical_reports
 
 # Initialize database schema and default seeds
 init_db()
@@ -53,11 +56,13 @@ def verify_patient_access(user: User, patient_id: str, db: Session) -> Patient:
         
     user_role_upper = (user.role or "").upper()
     
-    # Doctors & Interns can access assigned patients
+    # Doctors & Interns can access assigned patients only
     if user_role_upper in ["DOCTOR", "INTERN"]:
-        if patient.assigned_doctor_id and patient.assigned_doctor_id != user.id:
-            # Check if user is intern under same doctor or supervisor
-            pass  # Interns/Doctors can consult if assigned or for clinical cross-coverage
+        if patient.assigned_doctor_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: You are not assigned to this patient's clinical care team."
+            )
     return patient
 
 # Background task for processing approved PDFs
@@ -135,6 +140,9 @@ def startup_load_seeds():
                     print(f"Failed to process seed {safe_name}: {e}")
                     doc.status = "failed"
                 db.commit()
+                
+        # Reconcile unindexed clinical reports into Knowledge Base
+        reconcile_unindexed_clinical_reports(db)
     except Exception as e:
         print(f"Error in startup seed load: {e}")
     finally:
@@ -189,8 +197,12 @@ class PatientUpdate(BaseModel):
 class VitalsCreate(BaseModel):
     blood_pressure: Optional[str] = None
     pulse: Optional[int] = None
+    respiratory_rate: Optional[int] = None
     temperature: Optional[float] = None
     spo2: Optional[int] = None
+    blood_glucose: Optional[float] = None
+    pain_score: Optional[int] = None
+    intake_output: Optional[str] = None
     notes: Optional[str] = None
 
 class LabsCreate(BaseModel):
@@ -328,7 +340,7 @@ def change_password(req: ChangePasswordRequest, user: User = Depends(get_current
 
 @app.get("/api/users")
 def list_users(user: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
-    users = db.query(User).order_by(User.id.asc()).all()
+    users = db.query(User).filter(User.status != "DELETED").order_by(User.id.asc()).all()
     return [
         {
             "id": u.id,
@@ -349,7 +361,18 @@ def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"]))
     if role_upper not in ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role. Permitted roles: {ROLES}")
         
-    existing = db.query(User).filter((User.username == req.username) | (User.email == req.email)).first()
+    cleaned_email = req.email.strip() if req.email and req.email.strip() else None
+
+    # Check username uniqueness, and only check email uniqueness
+    # when an email was actually supplied.
+    query_filter = (User.username == req.username)
+    if cleaned_email:
+        query_filter = (
+            (User.username == req.username) |
+            (User.email == cleaned_email)
+        )
+
+    existing = db.query(User).filter(query_filter).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username or email already in use.")
         
@@ -358,7 +381,7 @@ def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"]))
         password_hash=hash_password(req.password),
         role=role_upper,
         name=req.name,
-        email=req.email,
+        email=cleaned_email,
         employee_id=req.employee_id or f"EMP-{random.randint(100, 999)}",
         department=req.department or "General",
         status="ACTIVE",
@@ -414,6 +437,47 @@ def toggle_user_status(user_id: int, status: str = Query(..., pattern="^(ACTIVE|
     log_audit_event(db, admin, "USER_STATUS_TOGGLED", "user", str(target.id), "SUCCESS", f"Set status of {target.name} to {status}")
     return {"message": f"User status changed to {status}."}
 
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own administrator account.")
+    if target.status == "DELETED":
+        raise HTTPException(status_code=400, detail="User is already deleted.")
+        
+    # Unassign any active patients assigned to this doctor
+    patients_assigned = db.query(Patient).filter(Patient.assigned_doctor_id == target.id).all()
+    for p in patients_assigned:
+        p.assigned_doctor_id = None
+        
+    target.status = "DELETED"
+    target.username = f"deleted_{target.id}_{target.username}"
+    if target.email:
+        target.email = f"deleted_{target.id}_{target.email}"
+    db.commit()
+    log_audit_event(db, admin, "USER_DELETED", "user", str(target.id), "SUCCESS", f"Deleted user {target.name} ({target.role})")
+    return {"message": f"User {target.name} deleted successfully."}
+
+@app.get("/api/doctors")
+def list_doctors(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns active doctors for Front Desk assignment selector."""
+    doctors = db.query(User).filter(
+        User.role == "DOCTOR",
+        User.status == "ACTIVE"
+    ).order_by(User.name.asc()).all()
+    
+    return [
+        {
+            "id": d.id,
+            "username": d.username,
+            "name": d.name,
+            "department": d.department or "General Medicine",
+            "employee_id": d.employee_id
+        } for d in doctors
+    ]
+
 # ----------------- PATIENT LIFECYCLE MANAGEMENT -----------------
 
 @app.get("/api/patients")
@@ -426,8 +490,8 @@ def get_patients(status: Optional[str] = None, user: User = Depends(get_current_
         
     user_role_upper = (user.role or "").upper()
     if user_role_upper in ["DOCTOR", "INTERN"]:
-        # Show assigned patients + department patients
-        patients = query.filter((Patient.assigned_doctor_id == user.id) | (Patient.assigned_doctor_id.is_(None))).all()
+        # Strict Doctor isolation: only return patients assigned to this clinician
+        patients = query.filter(Patient.assigned_doctor_id == user.id).all()
     else:
         patients = query.all()
         
@@ -450,7 +514,13 @@ def get_patients(status: Optional[str] = None, user: User = Depends(get_current_
     ]
 
 @app.post("/api/patients")
-def create_patient(req: PatientCreate, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK"])), db: Session = Depends(get_db)):
+def create_patient(req: PatientCreate, user: User = Depends(require_roles(["FRONT_DESK"])), db: Session = Depends(get_db)):
+    # If assigned_doctor_id is supplied, verify doctor exists and has DOCTOR role
+    if req.assigned_doctor_id:
+        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR").first()
+        if not doc_user:
+            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found or is not a Doctor.")
+
     # Generate Unique Patient ID (e.g., PAT-2026-000124)
     patient_count = db.query(Patient).count() + 1
     generated_id = f"PAT-2026-{patient_count:06d}"
@@ -514,8 +584,12 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
                 "id": v.id,
                 "blood_pressure": v.blood_pressure,
                 "pulse": v.pulse,
+                "respiratory_rate": v.respiratory_rate,
                 "temperature": v.temperature,
                 "spo2": v.spo2,
+                "blood_glucose": v.blood_glucose,
+                "pain_score": v.pain_score,
+                "intake_output": v.intake_output,
                 "notes": v.notes,
                 "recorded_by": v.recorder.name if v.recorder else "System",
                 "timestamp": v.timestamp
@@ -577,28 +651,60 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
     }
 
 @app.patch("/api/patients/{patient_id}")
-def update_patient(patient_id: str, req: PatientUpdate, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK", "DOCTOR"])), db: Session = Depends(get_db)):
-    patient = verify_patient_access(user, patient_id, db)
-    if req.name is not None:
-        patient.name = req.name
-    if req.age is not None:
-        patient.age = req.age
-    if req.gender is not None:
-        patient.gender = req.gender
-    if req.blood_group is not None:
-        patient.blood_group = req.blood_group
-    if req.contact_details is not None:
-        patient.contact_details = req.contact_details
-    if req.department is not None:
-        patient.department = req.department
+def update_patient(patient_id: str, req: PatientUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found.")
+        
+    user_role_upper = (user.role or "").upper()
+    
+    # 1. Doctor Assignment / Reassignment -> FRONT_DESK ONLY
     if req.assigned_doctor_id is not None:
+        if user_role_upper != "FRONT_DESK":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Only Front Desk staff are authorized to assign or reassign doctors."
+            )
+        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR").first()
+        if not doc_user:
+            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found or is not a Doctor.")
         patient.assigned_doctor_id = req.assigned_doctor_id
+        
+    # 2. Demographic Updates -> FRONT_DESK ONLY
+    has_demo_updates = any(v is not None for v in [req.name, req.age, req.gender, req.blood_group, req.contact_details, req.department])
+    if has_demo_updates:
+        if user_role_upper != "FRONT_DESK":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Demographic updates are restricted to Front Desk staff."
+            )
+        if req.name is not None:
+            patient.name = req.name
+        if req.age is not None:
+            patient.age = req.age
+        if req.gender is not None:
+            patient.gender = req.gender
+        if req.blood_group is not None:
+            patient.blood_group = req.blood_group
+        if req.contact_details is not None:
+            patient.contact_details = req.contact_details
+        if req.department is not None:
+            patient.department = req.department
+            
+    # 3. Clinical Health Status -> Doctor (assigned) or Front Desk
     if req.health_status is not None:
+        if user_role_upper in ["DOCTOR", "INTERN"]:
+            verify_patient_access(user, patient_id, db)
+        elif user_role_upper not in ["FRONT_DESK", "NURSE"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Unauthorized to update patient clinical health status."
+            )
         patient.health_status = req.health_status
         
     db.commit()
     log_audit_event(db, user, "PATIENT_UPDATED", "patient", patient.id, "SUCCESS")
-    return {"message": "Patient details updated."}
+    return {"message": "Patient details updated successfully."}
 
 @app.post("/api/patients/{patient_id}/discharge")
 def discharge_patient(patient_id: str, user: User = Depends(require_roles(["ADMIN", "FRONT_DESK", "DOCTOR"])), db: Session = Depends(get_db)):
@@ -618,12 +724,27 @@ def archive_patient(patient_id: str, user: User = Depends(require_roles(["ADMIN"
     return {"message": f"Patient {patient.name} record archived for long-term retention."}
 
 @app.delete("/api/patients/{patient_id}")
-def delete_patient(patient_id: str, admin: User = Depends(require_roles(["ADMIN"])), db: Session = Depends(get_db)):
-    patient = verify_patient_access(admin, patient_id, db)
+def delete_patient(patient_id: str, user: User = Depends(require_roles(["FRONT_DESK", "ADMIN"])), db: Session = Depends(get_db)):
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found.")
     patient.status = "DELETED"
+    
+    # 1. Unindex all patient clinical documents from vector store and mark DELETED
+    docs = db.query(Document).filter(Document.patient_id == patient_id).all()
+    for doc in docs:
+        doc.approval_status = "DELETED"
+        doc.status = "deleted"
+        remove_document_from_vector_store(doc.id)
+        
+    # 2. Archive any clinical reports associated with this patient
+    reports = db.query(ClinicalReport).filter(ClinicalReport.patient_id == patient_id).all()
+    for rep in reports:
+        rep.status = "ARCHIVED"
+        
     db.commit()
-    log_audit_event(db, admin, "PATIENT_PERMANENT_DELETION_AUDITED", "patient", patient.id, "SUCCESS", f"Audited soft-delete of patient {patient.name}.")
-    return {"message": f"Patient record {patient_id} soft-deleted and audited."}
+    log_audit_event(db, user, "PATIENT_DELETED", "patient", patient.id, "SUCCESS", f"Deleted patient {patient.name} ({patient.id}) and unindexed associated documents.")
+    return {"message": f"Patient record {patient_id} deleted successfully."}
 
 # ----------------- CLINICAL RECORD ENTRIES -----------------
 
@@ -638,14 +759,74 @@ def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(requi
         recorded_by=user.id,
         blood_pressure=req.blood_pressure,
         pulse=req.pulse,
+        respiratory_rate=req.respiratory_rate,
         temperature=req.temperature,
         spo2=req.spo2,
+        blood_glucose=req.blood_glucose,
+        pain_score=req.pain_score,
+        intake_output=req.intake_output,
         notes=req.notes
     )
     db.add(vitals)
     db.commit()
+    db.refresh(vitals)
     log_audit_event(db, user, "VITALS_RECORDED", "patient", patient_id, "SUCCESS")
-    return {"message": "Vitals recorded successfully."}
+    return {
+        "message": "Vitals recorded successfully.",
+        "id": vitals.id,
+        "blood_pressure": vitals.blood_pressure,
+        "pulse": vitals.pulse,
+        "respiratory_rate": vitals.respiratory_rate,
+        "temperature": vitals.temperature,
+        "spo2": vitals.spo2,
+        "blood_glucose": vitals.blood_glucose,
+        "pain_score": vitals.pain_score,
+        "intake_output": vitals.intake_output,
+        "notes": vitals.notes
+    }
+
+@app.get("/api/patients/{patient_id}/vitals")
+def get_patient_vitals(patient_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    verify_patient_access(user, patient_id, db)
+    vitals = db.query(PatientVitals).filter(PatientVitals.patient_id == patient_id).order_by(PatientVitals.timestamp.desc()).all()
+    return [
+        {
+            "id": v.id,
+            "blood_pressure": v.blood_pressure,
+            "pulse": v.pulse,
+            "respiratory_rate": v.respiratory_rate,
+            "temperature": v.temperature,
+            "spo2": v.spo2,
+            "blood_glucose": v.blood_glucose,
+            "pain_score": v.pain_score,
+            "intake_output": v.intake_output,
+            "notes": v.notes,
+            "recorded_by": v.recorder.name if v.recorder else "System",
+            "timestamp": v.timestamp.isoformat() if v.timestamp else None
+        } for v in vitals
+    ]
+
+@app.delete("/api/patients/{patient_id}/vitals/{vitals_id}")
+def delete_patient_vitals(
+    patient_id: str,
+    vitals_id: int,
+    user: User = Depends(require_roles(["NURSE", "ADMIN"])),
+    db: Session = Depends(get_db)
+):
+    vitals = db.query(PatientVitals).filter(
+        PatientVitals.id == vitals_id,
+        PatientVitals.patient_id == patient_id
+    ).first()
+    if not vitals:
+        raise HTTPException(status_code=404, detail="Vitals record not found.")
+        
+    db.delete(vitals)
+    db.commit()
+    log_audit_event(
+        db, user, "VITALS_DELETED", "patient", patient_id, "SUCCESS",
+        f"Deleted vitals record {vitals_id} for patient {patient_id}"
+    )
+    return {"message": f"Vitals record {vitals_id} deleted successfully."}
 
 # ----------------- LABORATORY ENDPOINTS -----------------
 
@@ -753,7 +934,7 @@ async def upload_laboratory_record(
             raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
             
         file_hash = compute_md5(file_bytes)
-        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
         
         if not version_info["is_duplicate"]:
             db_doc = Document(
@@ -822,6 +1003,26 @@ def record_labs(patient_id: str, req: LabsCreate, user: User = Depends(require_r
     db.commit()
     log_audit_event(db, user, "LABS_RECORDED", "patient", patient_id, "SUCCESS")
     return {"message": "Laboratory results recorded successfully."}
+
+@app.delete("/api/laboratory/{record_id}")
+def delete_laboratory_record(
+    record_id: int,
+    user: User = Depends(require_roles(["LABORATORY_TECHNICIAN", "OTHER_STAFF", "ADMIN"])),
+    db: Session = Depends(get_db)
+):
+    lab = db.query(LabResult).filter(LabResult.id == record_id).first()
+    if not lab:
+        raise HTTPException(status_code=404, detail="Laboratory record not found.")
+        
+    patient_id = lab.patient_id
+    db.delete(lab)
+    db.commit()
+    
+    log_audit_event(
+        db, user, "LAB_RECORD_DELETED", "laboratory", str(record_id), "SUCCESS",
+        f"Deleted laboratory record {record_id} for patient {patient_id}"
+    )
+    return {"message": f"Laboratory record {record_id} deleted successfully."}
 
 @app.post("/api/patients/{patient_id}/notes")
 def record_clinical_notes(patient_id: str, req: NotesCreate, user: User = Depends(require_roles(["DOCTOR", "INTERN", "ADMIN"])), db: Session = Depends(get_db)):
@@ -906,7 +1107,7 @@ async def upload_radiology_record(
                 raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
                 
             file_hash = compute_md5(file_bytes)
-            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
             
             if not version_info["is_duplicate"]:
                 db_doc = Document(
@@ -996,6 +1197,55 @@ def record_radiology(patient_id: str, req: RadiologyCreate, user: User = Depends
     log_audit_event(db, user, "RADIOLOGY_FINDINGS_RECORDED", "patient", patient_id, "SUCCESS")
     return {"message": "Radiology report logged successfully."}
 
+@app.delete("/api/radiology/{record_id}")
+def delete_radiology_record(
+    record_id: int,
+    user: User = Depends(require_roles(["RADIOLOGIST", "OTHER_STAFF", "ADMIN"])),
+    db: Session = Depends(get_db)
+):
+    report = db.query(RadiologyReport).filter(RadiologyReport.id == record_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Radiology report not found.")
+        
+    patient_id = report.patient_id
+    doc_id = report.document_id
+    
+    # 1. If associated document exists, clean DB, vector store, and files
+    if doc_id:
+        doc = db.query(Document).filter(Document.id == doc_id).first()
+        if doc:
+            if doc.file_path and os.path.exists(doc.file_path):
+                try:
+                    os.remove(doc.file_path)
+                except Exception:
+                    pass
+            doc.approval_status = "DELETED"
+            doc.status = "deleted"
+            if not doc.name.startswith("deleted_"):
+                doc.name = f"deleted_{doc.id}_{doc.name}"
+            db.commit()
+            try:
+                remove_document_from_vector_store(doc.id)
+            except Exception as e:
+                print(f"Error removing doc {doc.id} from vector store: {e}")
+                
+    # 2. If image file exists on disk, remove it
+    if report.image_path and os.path.exists(report.image_path):
+        try:
+            os.remove(report.image_path)
+        except Exception:
+            pass
+            
+    # 3. Delete radiology report row
+    db.delete(report)
+    db.commit()
+    
+    log_audit_event(
+        db, user, "RADIOLOGY_RECORD_DELETED", "radiology", str(record_id), "SUCCESS",
+        f"Deleted radiology record {record_id} for patient {patient_id}"
+    )
+    return {"message": f"Radiology record {record_id} deleted successfully."}
+
 # ----------------- AI PATIENT REPORT GENERATION -----------------
 
 @app.post("/api/reports/generate")
@@ -1047,6 +1297,7 @@ def update_report(report_id: int, req: ReportUpdateRequest, user: User = Depends
     report = db.query(ClinicalReport).filter(ClinicalReport.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found.")
+    verify_patient_access(user, report.patient_id, db)
         
     if req.title is not None:
         report.title = req.title
@@ -1068,8 +1319,9 @@ def update_report(report_id: int, req: ReportUpdateRequest, user: User = Depends
     db.commit()
     db.refresh(report)
     
-    # Re-sync updated report to Knowledge Base
-    sync_report_to_knowledge_base(report, user, db)
+    # Re-sync updated report to Knowledge Base ONLY if it is already approved
+    if report.status == "APPROVED":
+        sync_report_to_knowledge_base(report, user, db)
     
     log_audit_event(db, user, "REPORT_EDITED", "clinical_report", str(report.id), "SUCCESS")
     return {"message": "Report updated successfully."}
@@ -1079,6 +1331,7 @@ def approve_report(report_id: int, user: User = Depends(require_roles(["DOCTOR",
     report = db.query(ClinicalReport).filter(ClinicalReport.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found.")
+    verify_patient_access(user, report.patient_id, db)
         
     report.status = "APPROVED"
     report.approved_at = datetime.utcnow()
@@ -1086,7 +1339,7 @@ def approve_report(report_id: int, user: User = Depends(require_roles(["DOCTOR",
     db.commit()
     db.refresh(report)
     
-    # Re-sync approved report to Knowledge Base
+    # Sync approved authoritative report to Knowledge Base (FAISS + BM25)
     sync_report_to_knowledge_base(report, user, db)
     
     log_audit_event(db, user, "REPORT_APPROVED_OFFICIAL", "clinical_report", str(report.id), "SUCCESS", f"Report {report.id} approved by {user.name}")
@@ -1147,12 +1400,22 @@ async def upload_file(
     elif scope == "knowledge_base" and user_role_upper not in ["ADMIN", "DOCTOR"]:
         raise HTTPException(status_code=403, detail="Only Hospital Admins and Attending Physicians can contribute to the Knowledge Base.")
 
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported.")
         
     safe_name = os.path.basename(file.filename)
     safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+    if scope == "temporary":
+        safe_name = f"temp_{uuid.uuid4().hex[:8]}_{safe_name}"
     temp_path = os.path.join(UPLOAD_DIR, safe_name)
+    
+    # Free name slot if an old soft-deleted record exists with same name
+    existing_name_doc = db.query(Document).filter(Document.name == safe_name).first()
+    if existing_name_doc:
+        if existing_name_doc.approval_status == "DELETED":
+            if not existing_name_doc.name.startswith("deleted_"):
+                existing_name_doc.name = f"deleted_{existing_name_doc.id}_{existing_name_doc.name}"
+                db.commit()
     
     file_bytes = await file.read()
     with open(temp_path, "wb") as f:
@@ -1174,7 +1437,7 @@ async def upload_file(
         
     # 4. Duplicate & Version Check
     file_hash = compute_md5(file_bytes)
-    version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document)
+    version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope=scope)
     if version_info["is_duplicate"]:
         os.remove(temp_path)
         raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
@@ -1284,11 +1547,125 @@ def delete_document(doc_id: int, admin: User = Depends(require_roles(["ADMIN"]))
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
         
+    # Remove physical file from disk if present
+    if doc.file_path and os.path.exists(doc.file_path):
+        try:
+            os.remove(doc.file_path)
+        except Exception:
+            pass
+
     doc.approval_status = "DELETED"
+    doc.status = "deleted"
+    if not doc.name.startswith("deleted_"):
+        doc.name = f"deleted_{doc.id}_{doc.name}"
     db.commit()
     remove_document_from_vector_store(doc.id)
     log_audit_event(db, admin, "DOCUMENT_DELETED", "document", str(doc.id), "SUCCESS", f"Deleted document {doc.name}")
     return {"message": f"Document '{doc.name}' deleted."}
+
+@app.delete("/api/chat/attachments/{doc_id}")
+def detach_chat_attachment(
+    doc_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+        
+    if doc.scope != "temporary":
+        raise HTTPException(status_code=400, detail="Only temporary session attachments can be detached via this endpoint.")
+        
+    if doc.uploaded_by != user.id and (user.role or "").upper() != "ADMIN":
+        raise HTTPException(status_code=403, detail="Permission denied to detach this attachment.")
+        
+    # 1. Clean physical file from disk
+    if doc.file_path and os.path.exists(doc.file_path):
+        try:
+            os.remove(doc.file_path)
+        except Exception:
+            pass
+            
+    # 2. Mark as DELETED in database
+    doc.approval_status = "DELETED"
+    doc.status = "deleted"
+    if not doc.name.startswith("deleted_"):
+        doc.name = f"deleted_{doc.id}_{doc.name}"
+    db.commit()
+    
+    # 3. Synchronize vector stores (removes chunks from chunks.pkl, FAISS, and BM25)
+    remove_document_from_vector_store(doc.id)
+    
+    log_audit_event(db, user, "TEMPORARY_ATTACHMENT_DETACHED", "document", str(doc.id), "SUCCESS", f"Detached temporary chat attachment '{doc.name}' and cleaned all vectors.")
+    return {"message": f"Temporary attachment '{doc.name}' detached and completely cleaned up."}
+
+@app.get("/api/documents/{doc_id}/file")
+def get_document_file(
+    doc_id: int,
+    token: Optional[str] = Query(None),
+    auth_creds: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+    db: Session = Depends(get_db)
+):
+    """
+    Secure file serving endpoint. Validates user authentication (Bearer token or query param)
+    and enforces server-side patient isolation if document belongs to a patient.
+    """
+    user = None
+    auth_token = None
+    if auth_creds and auth_creds.credentials:
+        auth_token = auth_creds.credentials
+    elif token:
+        auth_token = token
+        
+    if auth_token:
+        try:
+            payload = decode_access_token(auth_token)
+            username = payload.get("sub") or payload.get("username")
+            if username:
+                user = db.query(User).filter(User.username == username).first()
+        except Exception:
+            pass
+            
+    if not user or user.status != "ACTIVE":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials not found or invalid.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+        
+    if doc.approval_status == "DELETED":
+        raise HTTPException(status_code=404, detail="Document has been deleted.")
+        
+    # Patient isolation authorization check
+    if doc.scope == "patient" and doc.patient_id:
+        verify_patient_access(user, doc.patient_id, db)
+        
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=404, detail="Physical document file not found on disk.")
+        
+    lower_path = doc.file_path.lower()
+    if lower_path.endswith(".pdf"):
+        media_type = "application/pdf"
+    elif lower_path.endswith(".txt"):
+        media_type = "text/plain"
+    elif lower_path.endswith(".png"):
+        media_type = "image/png"
+    elif lower_path.endswith(".jpg") or lower_path.endswith(".jpeg"):
+        media_type = "image/jpeg"
+    else:
+        media_type = "application/octet-stream"
+        
+    log_audit_event(db, user, "DOCUMENT_FILE_ACCESSED", "document", str(doc.id), "SUCCESS", f"Viewed file {doc.name}")
+    
+    return FileResponse(
+        path=doc.file_path,
+        media_type=media_type,
+        filename=doc.name
+    )
 
 # ----------------- TRUSTED SOURCES REGISTRY -----------------
 
@@ -1388,17 +1765,26 @@ def get_messages(session_id: str, user: User = Depends(get_current_user), db: Se
         sup = sum(1 for v in v_results if v.get("status") == "Supported")
         part = sum(1 for v in v_results if v.get("status") == "Partially Supported")
         contra = sum(1 for v in v_results if v.get("status") == "Contradiction" or v.get("nli_label") == "Contradiction")
-        if tot == 0:
+        
+        # Direct LLM mode check: if confidence is None, do not show any grounding/RAG scores
+        if m.confidence_score is None and m.confidence_level is None:
+            g_level = None
+            cov = ""
+        elif tot == 0:
             g_level = "Not Supported" if (m.confidence_level or "").lower() == "low" else "Partially Supported"
+            cov = ""
         elif contra > 0:
             g_level = "Not Supported"
+            cov = f"{sup} of {tot} claims supported"
         elif sup == tot and tot > 0:
             g_level = "Strongly Supported"
+            cov = f"{sup} of {tot} claims supported"
         elif sup > 0 or part > 0:
             g_level = "Partially Supported"
+            cov = f"{sup} of {tot} claims supported"
         else:
             g_level = "Not Supported"
-        cov = f"{sup} of {tot} claims supported" if tot > 0 else ""
+            cov = f"{sup} of {tot} claims supported"
 
         formatted_messages.append({
             "id": m.id,
@@ -1425,15 +1811,18 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         raise HTTPException(status_code=403, detail="Unauthorized to query in this session.")
         
     filters = request.filters or {}
-    if filters.get("scope") in ["patient", "patient_and_kb"]:
+    if not request.direct_llm and filters.get("scope") in ["patient", "patient_and_kb"]:
         patient_id = filters.get("patient_id")
         if not patient_id:
             raise HTTPException(status_code=400, detail="patient_id is required for patient scope queries.")
         verify_patient_access(user, patient_id, db)
         
-    # Get active approved documents
-    active_docs = db.query(Document.id).filter(Document.approval_status == "ACTIVE").all()
-    active_doc_ids = {d[0] for d in active_docs}
+    # Get active approved documents (only needed in RAG mode)
+    if not request.direct_llm:
+        active_docs = db.query(Document.id).filter(Document.approval_status == "ACTIVE").all()
+        active_doc_ids = {d[0] for d in active_docs}
+    else:
+        active_doc_ids = set()
     
     # Save user query
     user_msg = ChatMessage(session_id=request.session_id, role="user", content=request.query)
@@ -1446,13 +1835,14 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
             filters=filters,
             direct_llm=request.direct_llm,
             user_role=user.role,
-            active_doc_ids=active_doc_ids
+            active_doc_ids=active_doc_ids,
+            db=db
         )
     except Exception as e:
         db.delete(user_msg)
         db.commit()
         log_audit_event(db, user, "RAG_QUERY_FAILED", "session", request.session_id, "FAILURE", str(e))
-        raise HTTPException(status_code=500, detail=f"RAG failure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Query failure: {str(e)}")
         
     if session.title in ["New Consultation", "New Chat", "Clinical Chat"]:
         session.title = request.query[:40] + ("..." if len(request.query) > 40 else "")
@@ -1471,7 +1861,7 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
     db.commit()
     db.refresh(assistant_msg)
     
-    log_audit_event(db, user, "RAG_QUERY_COMPLETED", "session", request.session_id, "SUCCESS")
+    log_audit_event(db, user, "QUERY_COMPLETED", "session", request.session_id, "SUCCESS", f"Mode: {'direct_llm' if request.direct_llm else 'strict_rag'}")
     
     return {
         "id": assistant_msg.id,
@@ -1479,7 +1869,7 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         "content": assistant_msg.content,
         "confidence_level": assistant_msg.confidence_level,
         "confidence_score": assistant_msg.confidence_score,
-        "grounding_level": rag_result.get("grounding_level", "Partially Supported"),
+        "grounding_level": rag_result.get("grounding_level"),
         "grounding_coverage": rag_result.get("grounding_coverage", ""),
         "supported_claims": rag_result.get("supported_claims", 0),
         "total_claims": rag_result.get("total_claims", 0),
@@ -1488,9 +1878,10 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         "created_at": assistant_msg.created_at,
         "session_title": session.title,
         # Multi-RAG enhanced fields
+        "mode": "direct_llm" if request.direct_llm else "strict_rag",
         "answer": assistant_msg.content,
         "retrieval": rag_result.get("retrieval", {}),
-        "grounded": rag_result.get("grounded", True),
+        "grounded": rag_result.get("grounded", False if request.direct_llm else True),
         "citations": rag_result.get("citations", [])
     }
 

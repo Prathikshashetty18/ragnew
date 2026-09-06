@@ -89,6 +89,27 @@ export const UserManagement: React.FC = () => {
     }
   };
 
+  const handleDeleteUser = async (user: User) => {
+    if (!window.confirm(`Are you sure you want to delete staff account for ${user.name} (@${user.username})? Any active patients assigned to this doctor will be unassigned for reassignment.`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/users/${user.id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
+      });
+      if (res.ok) {
+        setSuccessMsg(`User ${user.name} deleted successfully.`);
+        fetchUsers();
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Failed to delete user.");
+      }
+    } catch (e) {
+      alert("Error deleting user.");
+    }
+  };
+
   return (
     <div className="flex-1 h-screen overflow-y-auto bg-slate-50 p-8">
       <div className="max-w-6xl mx-auto space-y-6">
@@ -233,14 +254,20 @@ export const UserManagement: React.FC = () => {
                         {u.status}
                       </span>
                     </td>
-                    <td className="p-4 text-right">
+                    <td className="p-4 text-right space-x-3">
                       <button
                         onClick={() => handleToggleStatus(u)}
                         className={`text-xs font-semibold underline ${
-                          u.status === "ACTIVE" ? "text-rose-900 hover:text-rose-700" : "text-emerald-800 hover:text-emerald-700"
+                          u.status === "ACTIVE" ? "text-amber-700 hover:text-amber-900" : "text-emerald-800 hover:text-emerald-700"
                         }`}
                       >
                         {u.status === "ACTIVE" ? "Deactivate" : "Activate"}
+                      </button>
+                      <button
+                        onClick={() => handleDeleteUser(u)}
+                        className="text-xs font-semibold text-rose-700 hover:text-rose-900 underline"
+                      >
+                        Delete
                       </button>
                     </td>
                   </tr>

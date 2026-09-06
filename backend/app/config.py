@@ -60,6 +60,8 @@ ROLES = [
     "FRONT_DESK",
     "INTERN",
     "NURSE",
+    "RADIOLOGIST",
+    "LABORATORY_TECHNICIAN",
     "OTHER_STAFF"
 ]
 
