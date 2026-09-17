@@ -5,7 +5,7 @@ import secrets
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from app.config import DATABASE_URL
+from app.config import DATABASE_URL, ADMIN_DEFAULT_PASSWORD
 
 # Setup SQLAlchemy engine and session
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
@@ -337,7 +337,7 @@ def init_db():
         users = [
             User(
                 username="admin",
-                password_hash=hash_pw_seed("Admin@123"),
+                password_hash=hash_pw_seed(ADMIN_DEFAULT_PASSWORD),
                 role="ADMIN",
                 name="Hospital Administrator",
                 email="admin@hospital.org",
@@ -474,12 +474,9 @@ def init_db():
             if not existing:
                 db.add(u)
             else:
-                if u.username != "admin":
-                    existing.password_hash = u.password_hash
-                    existing.role = u.role
-                    existing.status = u.status
-                    if u.specialty and not existing.specialty:
-                        existing.specialty = u.specialty
+                # Existing account: never overwrite password_hash, role, or status on restart
+                if u.specialty and not existing.specialty:
+                    existing.specialty = u.specialty
         db.commit()
 
         # Seed Trusted Sources

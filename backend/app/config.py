@@ -18,9 +18,36 @@ os.makedirs(SEED_DIR, exist_ok=True)
 # Database Configurations
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./clinical_rag_v2.db")
 
+# Environment Mode & Origins
+ENVIRONMENT = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", "development")).lower()
+IS_PRODUCTION = ENVIRONMENT in ["production", "prod"]
+
+raw_allowed_origins = os.environ.get("ALLOWED_ORIGINS", "")
+if raw_allowed_origins.strip():
+    ALLOWED_ORIGINS = [orig.strip() for orig in raw_allowed_origins.split(",") if orig.strip()]
+else:
+    ALLOWED_ORIGINS = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
 # Security & JWT Configurations
 CDSS_API_KEY = os.environ.get("CDSS_API_KEY", "")
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "cdss_clinical_rag_secret_key_2026_hospital_secure")
+_jwt_secret_env = os.environ.get("JWT_SECRET_KEY", "")
+
+if IS_PRODUCTION and not _jwt_secret_env:
+    raise RuntimeError(
+        "CRITICAL CONFIGURATION ERROR: JWT_SECRET_KEY environment variable is required in production mode. "
+        "Application startup aborted."
+    )
+elif _jwt_secret_env:
+    JWT_SECRET_KEY = _jwt_secret_env
+else:
+    # Explicit development fallback for local testing
+    JWT_SECRET_KEY = "dev_insecure_jwt_secret_do_not_use_in_production"
+
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))  # 12 hours
 ADMIN_DEFAULT_PASSWORD = os.environ.get("ADMIN_DEFAULT_PASSWORD", "Admin@123")

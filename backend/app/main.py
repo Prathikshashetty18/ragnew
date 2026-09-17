@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES
+from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES, ALLOWED_ORIGINS
 from app.database import (
     get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, 
     PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, 
@@ -39,10 +39,10 @@ app = FastAPI(
     description="Enterprise Clinical Decision Support System with Role-Based Access Control, NLI Grounding, and Scoped RAG"
 )
 
-# CORS middleware for frontend integration
+# CORS middleware for frontend integration (environment-driven)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -280,14 +280,20 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
             detail="Account is inactive. Please contact your Hospital Administrator."
         )
         
-    # If password is provided, verify it
-    if req.password:
-        if not verify_password(req.password, user.password_hash):
-            log_audit_event(db, user, "LOGIN_FAILED_PASSWORD", "user", str(user.id), "FAILURE", "Incorrect password entered.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials. Please verify your password."
-            )
+    # Every login attempt MUST require a non-empty password
+    if not req.password or not req.password.strip():
+        log_audit_event(db, user, "LOGIN_FAILED_EMPTY_PASSWORD", "user", str(user.id), "FAILURE", "Password missing or empty.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Password is required."
+        )
+        
+    if not verify_password(req.password, user.password_hash):
+        log_audit_event(db, user, "LOGIN_FAILED_PASSWORD", "user", str(user.id), "FAILURE", "Incorrect password entered.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials. Please verify your password."
+        )
             
     token = create_access_token({"sub": user.username, "role": user.role, "id": user.id})
     log_audit_event(db, user, "LOGIN_SUCCESS", "user", str(user.id), "SUCCESS")
@@ -306,11 +312,6 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
             "must_change_password": user.must_change_password
         }
     }
-
-# Legacy login endpoint for compatibility with frontend components
-@app.post("/api/login")
-def legacy_login(req: LoginRequest, db: Session = Depends(get_db)):
-    return login(req, db)
 
 @app.get("/api/auth/me")
 def get_me(user: User = Depends(get_current_user)):

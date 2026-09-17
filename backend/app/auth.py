@@ -115,20 +115,15 @@ def decode_access_token(token: str) -> dict:
 
 def get_current_user(
     auth_creds: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
-    x_user_id: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> User:
-    """Authenticates current user from Bearer Token or legacy X-User-Id header."""
+    """Authenticates current user strictly from verified Bearer JWT."""
     user = None
     if auth_creds and auth_creds.credentials:
         payload = decode_access_token(auth_creds.credentials)
         username = payload.get("sub") or payload.get("username")
         if username:
             user = db.query(User).filter(User.username == username).first()
-    elif x_user_id:
-        user = db.query(User).filter(User.username == x_user_id).first()
-        if not user and x_user_id.isdigit():
-            user = db.query(User).filter(User.id == int(x_user_id)).first()
             
     if not user:
         raise HTTPException(
