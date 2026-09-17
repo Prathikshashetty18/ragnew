@@ -3,7 +3,7 @@ import re
 import uuid
 import shutil
 import random
-from typing import List, Optional
+from typing import List, Optional, Literal
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query
 from fastapi.responses import FileResponse
@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES
+from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES
 from app.database import (
     get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, 
     PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, 
@@ -165,12 +165,14 @@ class UserCreate(BaseModel):
     email: Optional[str] = None
     employee_id: Optional[str] = None
     department: Optional[str] = None
+    specialty: Optional[str] = None
     must_change_password: bool = False
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     role: Optional[str] = None
     department: Optional[str] = None
+    specialty: Optional[str] = None
     email: Optional[str] = None
     status: Optional[str] = None
 
@@ -201,7 +203,7 @@ class VitalsCreate(BaseModel):
     temperature: Optional[float] = None
     spo2: Optional[int] = None
     blood_glucose: Optional[float] = None
-    pain_score: Optional[int] = None
+    pain_severity: Optional[Literal["NO_PAIN", "MILD", "MODERATE", "SEVERE"]] = None
     intake_output: Optional[str] = None
     notes: Optional[str] = None
 
@@ -350,6 +352,7 @@ def list_users(user: User = Depends(require_roles(["ADMIN"])), db: Session = Dep
             "email": u.email,
             "employee_id": u.employee_id,
             "department": u.department,
+            "specialty": u.specialty,
             "status": u.status,
             "created_at": u.created_at
         } for u in users
@@ -362,6 +365,22 @@ def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"]))
         raise HTTPException(status_code=400, detail=f"Invalid role. Permitted roles: {ROLES}")
         
     cleaned_email = req.email.strip() if req.email and req.email.strip() else None
+
+    # Role-based specialty validation
+    doctor_specialty = None
+    if role_upper == "DOCTOR":
+        if not req.specialty or req.specialty not in DOCTOR_SPECIALTIES:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Specialty is required for Doctor accounts. Permitted specialties: {DOCTOR_SPECIALTIES}"
+            )
+        doctor_specialty = req.specialty
+    else:
+        if req.specialty:
+            raise HTTPException(
+                status_code=400, 
+                detail="Doctor specialty can only be assigned to users with role DOCTOR."
+            )
 
     # Check username uniqueness, and only check email uniqueness
     # when an email was actually supplied.
@@ -384,8 +403,9 @@ def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"]))
         email=cleaned_email,
         employee_id=req.employee_id or f"EMP-{random.randint(100, 999)}",
         department=req.department or "General",
+        specialty=doctor_specialty,
         status="ACTIVE",
-        must_change_password=req.must_change_password
+        must_change_password=False
     )
     db.add(new_user)
     db.commit()
@@ -398,6 +418,7 @@ def create_user(req: UserCreate, admin: User = Depends(require_roles(["ADMIN"]))
         "name": new_user.name,
         "role": new_user.role,
         "department": new_user.department,
+        "specialty": new_user.specialty,
         "status": new_user.status,
         "message": "User account created successfully."
     }
@@ -413,8 +434,17 @@ def update_user(user_id: int, req: UserUpdate, admin: User = Depends(require_rol
     if req.role is not None:
         if req.role.upper() in ROLES:
             target.role = req.role.upper()
+            if target.role != "DOCTOR":
+                target.specialty = None
     if req.department is not None:
         target.department = req.department
+    if req.specialty is not None:
+        eff_role = (req.role.upper() if req.role else target.role)
+        if eff_role != "DOCTOR":
+            raise HTTPException(status_code=400, detail="Specialty can only be assigned to users with DOCTOR role.")
+        if req.specialty not in DOCTOR_SPECIALTIES:
+            raise HTTPException(status_code=400, detail=f"Invalid specialty. Permitted specialties: {DOCTOR_SPECIALTIES}")
+        target.specialty = req.specialty
     if req.email is not None:
         target.email = req.email
     if req.status is not None:
@@ -461,19 +491,25 @@ def delete_user(user_id: int, admin: User = Depends(require_roles(["ADMIN"])), d
     return {"message": f"User {target.name} deleted successfully."}
 
 @app.get("/api/doctors")
-def list_doctors(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Returns active doctors for Front Desk assignment selector."""
-    doctors = db.query(User).filter(
+def list_doctors(specialty: Optional[str] = Query(None), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns active doctors for Front Desk assignment selector, optionally filtered by clinical specialty."""
+    query = db.query(User).filter(
         User.role == "DOCTOR",
         User.status == "ACTIVE"
-    ).order_by(User.name.asc()).all()
+    )
+    if specialty:
+        query = query.filter(User.specialty == specialty)
+        
+    doctors = query.order_by(User.name.asc()).all()
     
     return [
         {
             "id": d.id,
             "username": d.username,
             "name": d.name,
+            "role": d.role,
             "department": d.department or "General Medicine",
+            "specialty": d.specialty or "General Medicine",
             "employee_id": d.employee_id
         } for d in doctors
     ]
@@ -507,6 +543,7 @@ def get_patients(status: Optional[str] = None, user: User = Depends(get_current_
             "health_status": p.health_status,
             "status": p.status,
             "assigned_doctor": p.assigned_doctor.name if p.assigned_doctor else None,
+            "assigned_doctor_specialty": p.assigned_doctor.specialty if p.assigned_doctor else None,
             "assigned_doctor_id": p.assigned_doctor_id,
             "admission_date": p.admission_date,
             "discharge_date": p.discharge_date
@@ -515,11 +552,11 @@ def get_patients(status: Optional[str] = None, user: User = Depends(get_current_
 
 @app.post("/api/patients")
 def create_patient(req: PatientCreate, user: User = Depends(require_roles(["FRONT_DESK"])), db: Session = Depends(get_db)):
-    # If assigned_doctor_id is supplied, verify doctor exists and has DOCTOR role
+    # If assigned_doctor_id is supplied, verify doctor exists, is active, and has DOCTOR role
     if req.assigned_doctor_id:
-        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR").first()
+        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR", User.status == "ACTIVE").first()
         if not doc_user:
-            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found or is not a Doctor.")
+            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found, inactive, or is not a Doctor.")
 
     # Generate Unique Patient ID (e.g., PAT-2026-000124)
     patient_count = db.query(Patient).count() + 1
@@ -576,6 +613,7 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
         "health_status": patient.health_status,
         "status": patient.status,
         "assigned_doctor": patient.assigned_doctor.name if patient.assigned_doctor else None,
+        "assigned_doctor_specialty": patient.assigned_doctor.specialty if patient.assigned_doctor else None,
         "assigned_doctor_id": patient.assigned_doctor_id,
         "admission_date": patient.admission_date,
         "discharge_date": patient.discharge_date,
@@ -588,7 +626,7 @@ def get_patient_profile(patient_id: str, user: User = Depends(get_current_user),
                 "temperature": v.temperature,
                 "spo2": v.spo2,
                 "blood_glucose": v.blood_glucose,
-                "pain_score": v.pain_score,
+                "pain_severity": v.pain_severity,
                 "intake_output": v.intake_output,
                 "notes": v.notes,
                 "recorded_by": v.recorder.name if v.recorder else "System",
@@ -665,9 +703,9 @@ def update_patient(patient_id: str, req: PatientUpdate, user: User = Depends(get
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access Denied: Only Front Desk staff are authorized to assign or reassign doctors."
             )
-        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR").first()
+        doc_user = db.query(User).filter(User.id == req.assigned_doctor_id, User.role == "DOCTOR", User.status == "ACTIVE").first()
         if not doc_user:
-            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found or is not a Doctor.")
+            raise HTTPException(status_code=400, detail=f"Doctor with ID {req.assigned_doctor_id} not found, inactive, or is not a Doctor.")
         patient.assigned_doctor_id = req.assigned_doctor_id
         
     # 2. Demographic Updates -> FRONT_DESK ONLY
@@ -763,7 +801,7 @@ def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(requi
         temperature=req.temperature,
         spo2=req.spo2,
         blood_glucose=req.blood_glucose,
-        pain_score=req.pain_score,
+        pain_severity=req.pain_severity,
         intake_output=req.intake_output,
         notes=req.notes
     )
@@ -780,7 +818,7 @@ def record_vitals(patient_id: str, req: VitalsCreate, user: User = Depends(requi
         "temperature": vitals.temperature,
         "spo2": vitals.spo2,
         "blood_glucose": vitals.blood_glucose,
-        "pain_score": vitals.pain_score,
+        "pain_severity": vitals.pain_severity,
         "intake_output": vitals.intake_output,
         "notes": vitals.notes
     }
@@ -798,7 +836,7 @@ def get_patient_vitals(patient_id: str, user: User = Depends(get_current_user), 
             "temperature": v.temperature,
             "spo2": v.spo2,
             "blood_glucose": v.blood_glucose,
-            "pain_score": v.pain_score,
+            "pain_severity": v.pain_severity,
             "intake_output": v.intake_output,
             "notes": v.notes,
             "recorded_by": v.recorder.name if v.recorder else "System",
@@ -1844,42 +1882,53 @@ def ask_question(request: QueryRequest, user: User = Depends(get_current_user), 
         log_audit_event(db, user, "RAG_QUERY_FAILED", "session", request.session_id, "FAILURE", str(e))
         raise HTTPException(status_code=500, detail=f"Query failure: {str(e)}")
         
-    if session.title in ["New Consultation", "New Chat", "Clinical Chat"]:
+    session = db.query(ChatSession).filter(ChatSession.id == request.session_id).first()
+    session_title = session.title if session else "Session Closed"
+
+    if session and session.title in ["New Consultation", "New Chat", "Clinical Chat"]:
         session.title = request.query[:40] + ("..." if len(request.query) > 40 else "")
+        session_title = session.title
+
+    assistant_msg_id = str(uuid.uuid4())
+    created_at_val = datetime.utcnow()
+
+    if session:
+        assistant_msg = ChatMessage(
+            id=assistant_msg_id,
+            session_id=request.session_id,
+            role="assistant",
+            content=rag_result["answer"],
+            confidence_level=rag_result["confidence_level"],
+            confidence_score=rag_result["confidence_score"]
+        )
+        assistant_msg.evidence = rag_result["evidence"]
+        assistant_msg.verification_results = rag_result["verification_results"]
         
-    assistant_msg = ChatMessage(
-        session_id=request.session_id,
-        role="assistant",
-        content=rag_result["answer"],
-        confidence_level=rag_result["confidence_level"],
-        confidence_score=rag_result["confidence_score"]
-    )
-    assistant_msg.evidence = rag_result["evidence"]
-    assistant_msg.verification_results = rag_result["verification_results"]
-    
-    db.add(assistant_msg)
-    db.commit()
-    db.refresh(assistant_msg)
-    
+        db.add(assistant_msg)
+        db.commit()
+        db.refresh(assistant_msg)
+        assistant_msg_id = assistant_msg.id
+        created_at_val = assistant_msg.created_at
+
     log_audit_event(db, user, "QUERY_COMPLETED", "session", request.session_id, "SUCCESS", f"Mode: {'direct_llm' if request.direct_llm else 'strict_rag'}")
     
     return {
-        "id": assistant_msg.id,
-        "role": assistant_msg.role,
-        "content": assistant_msg.content,
-        "confidence_level": assistant_msg.confidence_level,
-        "confidence_score": assistant_msg.confidence_score,
+        "id": assistant_msg_id,
+        "role": "assistant",
+        "content": rag_result["answer"],
+        "confidence_level": rag_result["confidence_level"],
+        "confidence_score": rag_result["confidence_score"],
         "grounding_level": rag_result.get("grounding_level"),
         "grounding_coverage": rag_result.get("grounding_coverage", ""),
         "supported_claims": rag_result.get("supported_claims", 0),
         "total_claims": rag_result.get("total_claims", 0),
-        "evidence": assistant_msg.evidence,
-        "verification_results": assistant_msg.verification_results,
-        "created_at": assistant_msg.created_at,
-        "session_title": session.title,
+        "evidence": rag_result["evidence"],
+        "verification_results": rag_result["verification_results"],
+        "created_at": created_at_val,
+        "session_title": session_title,
         # Multi-RAG enhanced fields
         "mode": "direct_llm" if request.direct_llm else "strict_rag",
-        "answer": assistant_msg.content,
+        "answer": rag_result["answer"],
         "retrieval": rag_result.get("retrieval", {}),
         "grounded": rag_result.get("grounded", False if request.direct_llm else True),
         "citations": rag_result.get("citations", [])

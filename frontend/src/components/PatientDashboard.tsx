@@ -1,11 +1,14 @@
 import React, { useState, useEffect } from "react";
 import { Activity, UserPlus, CheckCircle, UserCheck, Stethoscope, RefreshCw, HeartPulse, PlusCircle, Clock, X, Trash2 } from "lucide-react";
 import type { Patient, User, PatientVitals } from "../types";
+import { DOCTOR_SPECIALTIES } from "../types";
 
 interface DoctorOption {
   id: number;
   name: string;
+  role?: string;
   department: string;
+  specialty?: string;
   employee_id?: string;
 }
 
@@ -15,6 +18,16 @@ interface PatientDashboardProps {
   onSelectPatientForChat: (patientId: string) => void;
   onRefreshPatients: () => void;
 }
+
+export const formatPainSeverity = (severity?: string | null): string => {
+  switch (severity) {
+    case "NO_PAIN": return "No Pain";
+    case "MILD": return "Mild";
+    case "MODERATE": return "Moderate";
+    case "SEVERE": return "Severe";
+    default: return "—";
+  }
+};
 
 export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   patients,
@@ -26,6 +39,17 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   const [reassignPatient, setReassignPatient] = useState<Patient | null>(null);
   const [selectedDoctorId, setSelectedDoctorId] = useState<string>("");
   const [doctors, setDoctors] = useState<DoctorOption[]>([]);
+  const [intakeSpecialtyFilter, setIntakeSpecialtyFilter] = useState<string>("");
+  const [reassignSpecialtyFilter, setReassignSpecialtyFilter] = useState<string>("");
+  
+  // Filtered doctor lists for intake and reassignment
+  const filteredIntakeDoctors = intakeSpecialtyFilter
+    ? doctors.filter((d) => (d.specialty || "General Medicine") === intakeSpecialtyFilter)
+    : doctors;
+
+  const filteredReassignDoctors = reassignSpecialtyFilter
+    ? doctors.filter((d) => (d.specialty || "General Medicine") === reassignSpecialtyFilter)
+    : doctors;
   
   // Vitals Management States
   const [vitalsPatient, setVitalsPatient] = useState<Patient | null>(null);
@@ -40,7 +64,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   const [vTemp, setVTemp] = useState("");
   const [vSpo2, setVSpo2] = useState("");
   const [vGlucose, setVGlucose] = useState("");
-  const [vPain, setVPain] = useState("");
+  const [vPainSeverity, setVPainSeverity] = useState("");
   const [vIntakeOutput, setVIntakeOutput] = useState("");
   const [vNotes, setVNotes] = useState("");
   
@@ -104,6 +128,15 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   const handleRecordVitals = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!vitalsPatient) return;
+
+    if (vPainSeverity.trim()) {
+      const allowed = ["NO_PAIN", "MILD", "MODERATE", "SEVERE"];
+      if (!allowed.includes(vPainSeverity.trim())) {
+        alert("Invalid pain severity value.");
+        return;
+      }
+    }
+
     setLoading(true);
 
     try {
@@ -114,7 +147,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
       if (vTemp.trim()) payload.temperature = parseFloat(vTemp);
       if (vSpo2.trim()) payload.spo2 = parseInt(vSpo2);
       if (vGlucose.trim()) payload.blood_glucose = parseFloat(vGlucose);
-      if (vPain.trim()) payload.pain_score = parseInt(vPain);
+      if (vPainSeverity.trim()) payload.pain_severity = vPainSeverity.trim();
       if (vIntakeOutput.trim()) payload.intake_output = vIntakeOutput.trim();
       if (vNotes.trim()) payload.notes = vNotes.trim();
 
@@ -136,7 +169,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
         setVTemp("");
         setVSpo2("");
         setVGlucose("");
-        setVPain("");
+        setVPainSeverity("");
         setVIntakeOutput("");
         setVNotes("");
         setShowRecordVitalsForm(false);
@@ -213,6 +246,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
         setAge("");
         setContact("");
         setAssignedDoctorId("");
+        setIntakeSpecialtyFilter("");
         onRefreshPatients();
       } else {
         alert(data.detail || "Patient registration failed.");
@@ -246,6 +280,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
         setSuccessMsg(`Patient ${reassignPatient.name} re-assigned to new attending physician.`);
         setReassignPatient(null);
         setSelectedDoctorId("");
+        setReassignSpecialtyFilter("");
         onRefreshPatients();
       } else {
         alert(data.detail || "Re-assignment failed.");
@@ -361,11 +396,18 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                   </div>
 
                   {/* Assigned Doctor Badge */}
-                  <div className="mb-3 flex items-center gap-1.5 bg-rose-50/70 border border-rose-100 text-rose-950 px-2.5 py-1.5 rounded-lg text-xs">
-                    <UserCheck className="w-3.5 h-3.5 text-rose-800 shrink-0" />
-                    <span className="text-[11px] font-medium">
-                      Attending: <strong>{p.assigned_doctor ? `Dr. ${p.assigned_doctor}` : "Unassigned"}</strong>
-                    </span>
+                  <div className="mb-3 flex items-center justify-between bg-rose-50/70 border border-rose-100 text-rose-950 px-2.5 py-1.5 rounded-lg text-xs">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <UserCheck className="w-3.5 h-3.5 text-rose-800 shrink-0" />
+                      <span className="text-[11px] font-medium truncate">
+                        Attending: <strong>{p.assigned_doctor ? `Dr. ${p.assigned_doctor}` : "Unassigned"}</strong>
+                      </span>
+                    </div>
+                    {p.assigned_doctor_specialty && (
+                      <span className="ml-2 shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-900 border border-blue-200">
+                        {p.assigned_doctor_specialty}
+                      </span>
+                    )}
                   </div>
 
                   <div className="space-y-1.5 text-xs text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-100 mb-4">
@@ -500,7 +542,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                     </select>
                   </div>
                   <div>
-                    <label className="block font-semibold text-slate-700 mb-1">Department</label>
+                    <label className="block font-semibold text-slate-700 mb-1">Patient Department (Ward/Unit)</label>
                     <input
                       type="text"
                       value={department}
@@ -511,21 +553,45 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                   </div>
                 </div>
 
-                {/* Assigned Doctor Dropdown */}
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Assign Attending Physician</label>
-                  <select
-                    value={assignedDoctorId}
-                    onChange={(e) => setAssignedDoctorId(e.target.value)}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
-                  >
-                    <option value="">-- Select Doctor (or assign later) --</option>
-                    {doctors.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        Dr. {d.name} ({d.department})
-                      </option>
-                    ))}
-                  </select>
+                {/* Assigned Doctor Dropdown with Specialty Filtering */}
+                <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Filter Doctors by Specialty</label>
+                    <select
+                      value={intakeSpecialtyFilter}
+                      onChange={(e) => {
+                        setIntakeSpecialtyFilter(e.target.value);
+                        setAssignedDoctorId("");
+                      }}
+                      className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
+                    >
+                      <option value="">All Specialties ({doctors.length} Doctors Available)</option>
+                      {DOCTOR_SPECIALTIES.map((spec) => {
+                        const count = doctors.filter((d) => (d.specialty || "General Medicine") === spec).length;
+                        return (
+                          <option key={spec} value={spec}>
+                            {spec} ({count})
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Assign Attending Physician</label>
+                    <select
+                      value={assignedDoctorId}
+                      onChange={(e) => setAssignedDoctorId(e.target.value)}
+                      className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
+                    >
+                      <option value="">-- Select Doctor (or assign later) --</option>
+                      {filteredIntakeDoctors.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          Dr. {d.name} — {d.specialty || "General Medicine"} ({d.department})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
 
                 <div>
@@ -574,6 +640,28 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
 
               <form onSubmit={handleReassignDoctor} className="space-y-4 text-xs">
                 <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Filter Doctors by Specialty</label>
+                  <select
+                    value={reassignSpecialtyFilter}
+                    onChange={(e) => {
+                      setReassignSpecialtyFilter(e.target.value);
+                      setSelectedDoctorId("");
+                    }}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
+                  >
+                    <option value="">All Specialties ({doctors.length} Doctors Available)</option>
+                    {DOCTOR_SPECIALTIES.map((spec) => {
+                      const count = doctors.filter((d) => (d.specialty || "General Medicine") === spec).length;
+                      return (
+                        <option key={spec} value={spec}>
+                          {spec} ({count})
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                <div>
                   <label className="block font-semibold text-slate-700 mb-1">Select New Attending Doctor *</label>
                   <select
                     required
@@ -582,9 +670,9 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                     className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
                   >
                     <option value="">-- Select Doctor --</option>
-                    {doctors.map((d) => (
+                    {filteredReassignDoctors.map((d) => (
                       <option key={d.id} value={d.id}>
-                        Dr. {d.name} ({d.department})
+                        Dr. {d.name} — {d.specialty || "General Medicine"} ({d.department})
                       </option>
                     ))}
                   </select>
@@ -722,16 +810,18 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="block font-semibold text-slate-700 mb-1">Pain Score (0–10)</label>
-                        <input
-                          type="number"
-                          min="0"
-                          max="10"
-                          placeholder="e.g. 2"
-                          value={vPain}
-                          onChange={(e) => setVPain(e.target.value)}
-                          className="w-full p-2 bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-700"
-                        />
+                        <label className="block font-semibold text-slate-700 mb-1">Pain Severity</label>
+                        <select
+                          value={vPainSeverity}
+                          onChange={(e) => setVPainSeverity(e.target.value)}
+                          className="w-full p-2 bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-700 text-sm"
+                        >
+                          <option value="">Select pain severity</option>
+                          <option value="NO_PAIN">No Pain</option>
+                          <option value="MILD">Mild</option>
+                          <option value="MODERATE">Moderate</option>
+                          <option value="SEVERE">Severe</option>
+                        </select>
                       </div>
                     </div>
 
@@ -827,8 +917,8 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
                             <strong className="text-slate-800">{v.blood_glucose ? `${v.blood_glucose} mg/dL` : "—"}</strong>
                           </div>
                           <div className="bg-white p-2 rounded-lg border border-slate-100">
-                            <span className="text-slate-400 block text-[10px]">Pain Score</span>
-                            <strong className="text-slate-800">{v.pain_score !== undefined && v.pain_score !== null ? `${v.pain_score}/10` : "—"}</strong>
+                            <span className="text-slate-400 block text-[10px]">Pain Severity</span>
+                            <strong className="text-slate-800">{formatPainSeverity(v.pain_severity)}</strong>
                           </div>
                         </div>
                         {v.intake_output && (

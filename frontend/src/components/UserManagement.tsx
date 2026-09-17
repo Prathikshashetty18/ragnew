@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
-import { UserPlus, CheckCircle } from "lucide-react";
+import { UserPlus, CheckCircle, Edit3, X } from "lucide-react";
 import type { User } from "../types";
+import { DOCTOR_SPECIALTIES } from "../types";
 
 export const UserManagement: React.FC = () => {
   const [users, setUsers] = useState<User[]>([]);
@@ -9,9 +10,14 @@ export const UserManagement: React.FC = () => {
   const [name, setName] = useState("");
   const [role, setRole] = useState("DOCTOR");
   const [department, setDepartment] = useState("Internal Medicine");
+  const [specialty, setSpecialty] = useState<string>("General Medicine");
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
+  // Edit Specialty Modal state
+  const [editingDoctor, setEditingDoctor] = useState<User | null>(null);
+  const [editSpecialtyVal, setEditSpecialtyVal] = useState<string>("General Medicine");
 
   const fetchUsers = async () => {
     try {
@@ -49,7 +55,9 @@ export const UserManagement: React.FC = () => {
           name,
           role,
           department,
+          specialty: role === "DOCTOR" ? specialty : undefined,
           email: email || undefined,
+          must_change_password: false,
         }),
       });
 
@@ -60,12 +68,43 @@ export const UserManagement: React.FC = () => {
         setPassword("");
         setName("");
         setEmail("");
+        setSpecialty("General Medicine");
         fetchUsers();
       } else {
         alert(data.detail || "User creation failed.");
       }
     } catch (e) {
       alert("Error creating user.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpdateDoctorSpecialty = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingDoctor) return;
+    setLoading(true);
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/users/${editingDoctor.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
+        },
+        body: JSON.stringify({
+          specialty: editSpecialtyVal,
+        }),
+      });
+      if (res.ok) {
+        setSuccessMsg(`Updated specialty for Dr. ${editingDoctor.name} to ${editSpecialtyVal}`);
+        setEditingDoctor(null);
+        fetchUsers();
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Failed to update specialty.");
+      }
+    } catch (e) {
+      alert("Error updating specialty.");
     } finally {
       setLoading(false);
     }
@@ -159,7 +198,7 @@ export const UserManagement: React.FC = () => {
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Temporary Password *</label>
+                <label className="block font-semibold text-slate-700 mb-1">Password *</label>
                 <input
                   type="password"
                   required
@@ -187,6 +226,28 @@ export const UserManagement: React.FC = () => {
                   <option value="OTHER_STAFF">Hospital General Staff (OTHER_STAFF)</option>
                 </select>
               </div>
+
+              {role === "DOCTOR" && (
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">
+                    Doctor Specialty <span className="text-rose-600">*</span>
+                  </label>
+                  <select
+                    value={specialty}
+                    onChange={(e) => setSpecialty(e.target.value)}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
+                  >
+                    {DOCTOR_SPECIALTIES.map((spec) => (
+                      <option key={spec} value={spec}>
+                        {spec}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Clinical specialization for patient care assignment.
+                  </p>
+                </div>
+              )}
 
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Department</label>
@@ -228,8 +289,9 @@ export const UserManagement: React.FC = () => {
                   <th className="p-4">Name / Username</th>
                   <th className="p-4">Role</th>
                   <th className="p-4">Department</th>
+                  <th className="p-4">Specialty</th>
                   <th className="p-4">Status</th>
-                  <th className="p-4 text-right">Actions</th>
+                  <th className="p-4 text-left min-w-[130px]">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-slate-700">
@@ -246,6 +308,15 @@ export const UserManagement: React.FC = () => {
                     </td>
                     <td className="p-4">{u.department || "General"}</td>
                     <td className="p-4">
+                      {u.role === "DOCTOR" ? (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200">
+                          {u.specialty || "General Medicine"}
+                        </span>
+                      ) : (
+                        <span className="text-slate-400 italic text-[11px]">—</span>
+                      )}
+                    </td>
+                    <td className="p-4">
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
                         u.status === "ACTIVE"
                           ? "bg-emerald-50 text-emerald-800 border-emerald-200"
@@ -254,21 +325,37 @@ export const UserManagement: React.FC = () => {
                         {u.status}
                       </span>
                     </td>
-                    <td className="p-4 text-right space-x-3">
-                      <button
-                        onClick={() => handleToggleStatus(u)}
-                        className={`text-xs font-semibold underline ${
-                          u.status === "ACTIVE" ? "text-amber-700 hover:text-amber-900" : "text-emerald-800 hover:text-emerald-700"
-                        }`}
-                      >
-                        {u.status === "ACTIVE" ? "Deactivate" : "Activate"}
-                      </button>
-                      <button
-                        onClick={() => handleDeleteUser(u)}
-                        className="text-xs font-semibold text-rose-700 hover:text-rose-900 underline"
-                      >
-                        Delete
-                      </button>
+                    <td className="p-4 text-left">
+                      <div className="flex flex-col items-start gap-1.5 whitespace-nowrap">
+                        {u.role === "DOCTOR" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingDoctor(u);
+                              setEditSpecialtyVal(u.specialty || "General Medicine");
+                            }}
+                            className="text-xs font-semibold text-blue-700 hover:text-blue-900 underline text-left cursor-pointer"
+                          >
+                            Edit Specialty
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleToggleStatus(u)}
+                          className={`text-xs font-semibold underline text-left cursor-pointer ${
+                            u.status === "ACTIVE" ? "text-amber-700 hover:text-amber-900" : "text-emerald-800 hover:text-emerald-700"
+                          }`}
+                        >
+                          {u.status === "ACTIVE" ? "Deactivate" : "Activate"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteUser(u)}
+                          className="text-xs font-semibold text-rose-700 hover:text-rose-900 underline text-left cursor-pointer"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -276,6 +363,64 @@ export const UserManagement: React.FC = () => {
             </table>
           </div>
         </div>
+
+        {/* Edit Specialty Modal */}
+        {editingDoctor && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-200">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Edit3 className="w-4 h-4 text-blue-700" />
+                  Edit Doctor Specialty
+                </h2>
+                <button
+                  onClick={() => setEditingDoctor(null)}
+                  className="p-1 text-slate-400 hover:text-slate-600 rounded-lg"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-600 mb-3">
+                Update clinical specialty for <strong>{editingDoctor.name}</strong> (@{editingDoctor.username}):
+              </p>
+
+              <form onSubmit={handleUpdateDoctorSpecialty} className="space-y-4 text-xs">
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Clinical Specialty</label>
+                  <select
+                    value={editSpecialtyVal}
+                    onChange={(e) => setEditSpecialtyVal(e.target.value)}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-rose-800 font-medium"
+                  >
+                    {DOCTOR_SPECIALTIES.map((spec) => (
+                      <option key={spec} value={spec}>
+                        {spec}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditingDoctor(null)}
+                    className="py-2 px-3 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="py-2 px-4 bg-blue-700 hover:bg-blue-800 text-white rounded-xl font-semibold shadow transition disabled:opacity-50"
+                  >
+                    {loading ? "Saving..." : "Save Specialty"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

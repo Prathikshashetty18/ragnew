@@ -64,7 +64,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           className="mt-4 w-full py-2.5 px-3 bg-rose-900 hover:bg-rose-800 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2 shadow-sm transition active:scale-[0.98]"
         >
           <Plus className="w-4 h-4" />
-          <span>+ New Chat</span>
+          <span> New Chat</span>
         </button>
       </div>
 

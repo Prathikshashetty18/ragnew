@@ -8,12 +8,27 @@ export type UserRole =
   | "FRONT_DESK"
   | "OTHER_STAFF";
 
+export const DOCTOR_SPECIALTIES = [
+  "General Medicine",
+  "Cardiology",
+  "Neurology",
+  "Orthopedics",
+  "Pediatrics",
+  "Dermatology",
+  "Gastroenterology",
+  "Pulmonology",
+  "Emergency Medicine",
+] as const;
+
+export type DoctorSpecialty = typeof DOCTOR_SPECIALTIES[number];
+
 export interface User {
   id: number;
   username: string;
   name: string;
   role: UserRole;
   department?: string;
+  specialty?: string;
   employee_id?: string;
   email?: string;
   status: "ACTIVE" | "INACTIVE";
@@ -33,9 +48,12 @@ export interface Patient {
   status: "ACTIVE" | "DISCHARGED" | "ARCHIVED" | "DELETED";
   assigned_doctor?: string;
   assigned_doctor_id?: number;
+  assigned_doctor_specialty?: string;
   admission_date?: string;
   discharge_date?: string;
 }
+
+export type PainSeverity = "NO_PAIN" | "MILD" | "MODERATE" | "SEVERE";
 
 export interface PatientVitals {
   id: number;
@@ -45,7 +63,7 @@ export interface PatientVitals {
   temperature?: number;
   spo2?: number;
   blood_glucose?: number;
-  pain_score?: number;
+  pain_severity?: PainSeverity;
   intake_output?: string;
   notes?: string;
   recorded_by?: string;

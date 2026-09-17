@@ -82,3 +82,16 @@ PATIENT_STATUSES = [
     "ARCHIVED",
     "DELETED"
 ]
+
+# Controlled Doctor Specialties
+DOCTOR_SPECIALTIES = [
+    "General Medicine",
+    "Cardiology",
+    "Neurology",
+    "Orthopedics",
+    "Pediatrics",
+    "Dermatology",
+    "Gastroenterology",
+    "Pulmonology",
+    "Emergency Medicine"
+]

@@ -58,8 +58,14 @@ def build_patient_context_summary(patient_id: str, db: Session) -> Dict[str, Any
             v_parts.append(f"SpO2: {v_latest.spo2}%")
         if v_latest.blood_glucose is not None:
             v_parts.append(f"Blood Glucose: {v_latest.blood_glucose} mg/dL")
-        if v_latest.pain_score is not None:
-            v_parts.append(f"Pain Score: {v_latest.pain_score}/10")
+        if getattr(v_latest, "pain_severity", None):
+            sev_label = {
+                "NO_PAIN": "No Pain",
+                "MILD": "Mild",
+                "MODERATE": "Moderate",
+                "SEVERE": "Severe"
+            }.get(v_latest.pain_severity, v_latest.pain_severity)
+            v_parts.append(f"Pain Severity: {sev_label}")
         if v_latest.intake_output:
             v_parts.append(f"Intake/Output: {v_latest.intake_output}")
         if v_latest.notes:

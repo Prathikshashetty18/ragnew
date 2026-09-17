@@ -262,7 +262,7 @@ export const ReportStudio: React.FC<ReportStudioProps> = ({ patients }) => {
               </div>
 
               <div>
-                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">7. Hospital Guidelines & Citations Grounding</label>
+                <label className="block font-bold text-slate-700 uppercase tracking-wider mb-1">7. Hospital Guidelines & References</label>
                 <input
                   type="text"
                   value={currentReport.sources || ""}

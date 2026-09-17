@@ -31,6 +31,7 @@ class User(Base):
     email = Column(String(150), nullable=True)
     employee_id = Column(String(50), nullable=True)
     department = Column(String(100), nullable=True)
+    specialty = Column(String(100), nullable=True)
     status = Column(String(50), default="ACTIVE")  # ACTIVE, INACTIVE
     must_change_password = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -82,7 +83,7 @@ class PatientVitals(Base):
     temperature = Column(Float, nullable=True)
     spo2 = Column(Integer, nullable=True)
     blood_glucose = Column(Float, nullable=True)
-    pain_score = Column(Integer, nullable=True)
+    pain_severity = Column(String(50), nullable=True)
     intake_output = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -292,10 +293,40 @@ def init_db():
                     conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN respiratory_rate INTEGER"))
                 if "blood_glucose" not in vitals_cols:
                     conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN blood_glucose FLOAT"))
-                if "pain_score" not in vitals_cols:
-                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN pain_score INTEGER"))
+                if "pain_severity" not in vitals_cols:
+                    conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN pain_severity VARCHAR(50)"))
                 if "intake_output" not in vitals_cols:
                     conn.execute(text("ALTER TABLE patient_vitals ADD COLUMN intake_output VARCHAR(255)"))
+                
+                # Migrate existing numeric pain_score values to categorical pain_severity
+                if "pain_score" in vitals_cols:
+                    conn.execute(text("""
+                        UPDATE patient_vitals 
+                        SET pain_severity = CASE
+                            WHEN pain_score = 0 THEN 'NO_PAIN'
+                            WHEN pain_score >= 1 AND pain_score <= 3 THEN 'MILD'
+                            WHEN pain_score >= 4 AND pain_score <= 6 THEN 'MODERATE'
+                            WHEN pain_score >= 7 AND pain_score <= 10 THEN 'SEVERE'
+                            ELSE NULL
+                        END
+                        WHERE pain_severity IS NULL AND pain_score IS NOT NULL
+                    """))
+                conn.commit()
+
+            # Ensure users table has specialty column
+            result_users = conn.execute(text("PRAGMA table_info(users)"))
+            users_cols = {row[1] for row in result_users.fetchall()}
+            if users_cols:
+                if "specialty" not in users_cols:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN specialty VARCHAR(100)"))
+                
+                # Backfill specialties for existing doctors if null
+                conn.execute(text("UPDATE users SET specialty = 'Cardiology' WHERE username = 'reshma' AND (specialty IS NULL OR specialty = '')"))
+                conn.execute(text("UPDATE users SET specialty = 'General Medicine' WHERE username = 'arun' AND (specialty IS NULL OR specialty = '')"))
+                conn.execute(text("UPDATE users SET specialty = 'Cardiology' WHERE username = 'meera' AND (specialty IS NULL OR specialty = '')"))
+                conn.execute(text("UPDATE users SET specialty = 'Pulmonology' WHERE username = 'dr_smith' AND (specialty IS NULL OR specialty = '')"))
+                conn.execute(text("UPDATE users SET specialty = 'Cardiology' WHERE username = 'dr.aditi' AND (specialty IS NULL OR specialty = '')"))
+                conn.execute(text("UPDATE users SET specialty = 'General Medicine' WHERE role = 'DOCTOR' AND (specialty IS NULL OR specialty = '')"))
                 conn.commit()
     except Exception:
         pass
@@ -322,6 +353,7 @@ def init_db():
                 email="reshma@hospital.org",
                 employee_id="EMP-DOC-103",
                 department="Internal Medicine",
+                specialty="Cardiology",
                 status="ACTIVE"
             ),
             User(
@@ -372,6 +404,7 @@ def init_db():
                 email="arun@hospital.org",
                 employee_id="EMP-DOC-101",
                 department="Internal Medicine",
+                specialty="General Medicine",
                 status="ACTIVE"
             ),
             User(
@@ -382,6 +415,7 @@ def init_db():
                 email="meera@hospital.org",
                 employee_id="EMP-DOC-102",
                 department="Cardiology",
+                specialty="Cardiology",
                 status="ACTIVE"
             ),
             User(
@@ -444,6 +478,8 @@ def init_db():
                     existing.password_hash = u.password_hash
                     existing.role = u.role
                     existing.status = u.status
+                    if u.specialty and not existing.specialty:
+                        existing.specialty = u.specialty
         db.commit()
 
         # Seed Trusted Sources

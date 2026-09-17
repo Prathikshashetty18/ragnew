@@ -116,7 +116,31 @@ def get_vector_store() -> Tuple[faiss.Index, List[Dict[str, Any]], Optional[np.n
                 _chunks_metadata = []
                 _embeddings_array = None
 
-        return _faiss_index, _chunks_metadata, _embeddings_array
+        # Verify snapshot consistency
+        if _faiss_index is not None:
+            ntotal = _faiss_index.ntotal
+            meta_len = len(_chunks_metadata)
+            embed_len = len(_embeddings_array) if _embeddings_array is not None else 0
+            if ntotal != meta_len or ntotal != embed_len:
+                print(f"[VECTOR STORE SYNC] Inconsistency detected: FAISS={ntotal}, Metadata={meta_len}, Embeddings={embed_len}. Synchronizing...")
+                if meta_len > 0:
+                    embedder = get_embedding_model()
+                    texts = [c.get("contextualized_text") or c["text"] for c in _chunks_metadata]
+                    embeddings = embedder.encode(texts, show_progress_bar=False)
+                    embeddings = np.array(embeddings).astype("float32")
+                    faiss.normalize_L2(embeddings)
+                    new_index = faiss.IndexFlatIP(384)
+                    new_index.add(embeddings)
+                    _faiss_index = new_index
+                    _embeddings_array = embeddings
+                    save_vector_store(_faiss_index, _chunks_metadata)
+                else:
+                    _faiss_index = faiss.IndexFlatIP(384)
+                    _embeddings_array = None
+                    save_vector_store(_faiss_index, _chunks_metadata)
+
+        # Return atomic snapshot (shallow copy of metadata list guarantees caller cannot mutate shared state)
+        return _faiss_index, list(_chunks_metadata), _embeddings_array
 
 
 def get_bm25_index() -> PersistentBM25Index:
@@ -162,12 +186,14 @@ def remove_document_from_vector_store(doc_id: int):
             embeddings = np.array(embeddings).astype("float32")
             faiss.normalize_L2(embeddings)
             new_index.add(embeddings)
-            _embeddings_array = embeddings
+            new_embeddings_array = embeddings
         else:
-            _embeddings_array = None
+            new_embeddings_array = None
 
+        # Atomic in-memory swap
         _faiss_index = new_index
         _chunks_metadata = retained_chunks
+        _embeddings_array = new_embeddings_array
         save_vector_store(_faiss_index, _chunks_metadata)
 
         # Update persistent BM25 index
@@ -238,21 +264,23 @@ def process_pdf(
     embeddings = np.array(embeddings).astype("float32")
     faiss.normalize_L2(embeddings)
 
-    index, metadata, embed_arr = get_vector_store()
-    index.add(embeddings)
-    metadata.extend(all_chunks)
+    with _vector_store_lock:
+        global _embeddings_array, _faiss_index, _chunks_metadata
+        index, metadata, embed_arr = get_vector_store()
+        index.add(embeddings)
+        _chunks_metadata = list(metadata) + all_chunks
 
-    global _embeddings_array
-    if _embeddings_array is None:
-        _embeddings_array = embeddings
-    else:
-        _embeddings_array = np.vstack([_embeddings_array, embeddings])
+        if _embeddings_array is None or len(_embeddings_array) == 0:
+            _embeddings_array = embeddings
+        else:
+            _embeddings_array = np.vstack([_embeddings_array, embeddings])
+        _faiss_index = index
 
-    save_vector_store(index, metadata)
+        save_vector_store(_faiss_index, _chunks_metadata)
 
-    # Update persistent BM25 index
-    bm25 = get_bm25_index()
-    bm25.add_chunks(all_chunks)
+        # Update persistent BM25 index
+        bm25 = get_bm25_index()
+        bm25.add_chunks(all_chunks)
 
     return len(all_chunks)
 
@@ -301,21 +329,22 @@ def index_text_document(
     faiss.normalize_L2(embeddings)
 
     with _vector_store_lock:
+        global _embeddings_array, _faiss_index, _chunks_metadata
         index, metadata, embed_arr = get_vector_store()
         index.add(embeddings)
-        metadata.extend(chunks)
+        _chunks_metadata = list(metadata) + chunks
 
-        global _embeddings_array
-        if _embeddings_array is None:
+        if _embeddings_array is None or len(_embeddings_array) == 0:
             _embeddings_array = embeddings
         else:
             _embeddings_array = np.vstack([_embeddings_array, embeddings])
+        _faiss_index = index
 
-        save_vector_store(index, metadata)
+        save_vector_store(_faiss_index, _chunks_metadata)
 
-    # Update persistent BM25 index
-    bm25 = get_bm25_index()
-    bm25.add_chunks(chunks)
+        # Update persistent BM25 index
+        bm25 = get_bm25_index()
+        bm25.add_chunks(chunks)
 
     print(f"Indexed text document '{document_name}' (doc_id={doc_id}, scope={scope}, patient={patient_id}): {len(chunks)} chunks.")
     return len(chunks)
@@ -339,27 +368,45 @@ DEFAULT_DIRECT_LLM_SYSTEM_PROMPT = (
     "using general clinical medical knowledge and evidence-based medicine principles. Format your answer cleanly and elegantly in markdown."
 )
 
+SERVICE_UNAVAILABLE_MESSAGE = (
+    "Unable to generate the clinical response at this time. "
+    "The relevant clinical evidence was retrieved successfully, but the language-generation service is temporarily unavailable. "
+    "Please try again shortly."
+)
+
 
 def call_groq_llm(prompt: str, max_tokens: int = 4096, system_prompt: Optional[str] = None) -> str:
-    try:
-        sys_content = system_prompt or DEFAULT_STRICT_RAG_SYSTEM_PROMPT
-        client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": sys_content
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3 if system_prompt == DEFAULT_DIRECT_LLM_SYSTEM_PROMPT else 0.05,
-            max_tokens=max_tokens
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        print(f"Groq API call failed: {e}")
-        raise e
+    sys_content = system_prompt or DEFAULT_STRICT_RAG_SYSTEM_PROMPT
+    client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
+    models_to_try = [GROQ_MODEL]
+    for fallback_model in ["openai/gpt-oss-20b", "qwen/qwen3.6-27b"]:
+        if fallback_model not in models_to_try:
+            models_to_try.append(fallback_model)
+
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": sys_content
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3 if system_prompt == DEFAULT_DIRECT_LLM_SYSTEM_PROMPT else 0.05,
+                max_tokens=max_tokens
+            )
+            content = completion.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+        except Exception as e:
+            last_error = e
+            print(f"Groq model {model_name} call failed: {e}")
+            continue
+
+    raise last_error or RuntimeError("All Groq models failed.")
 
 
 def call_gemini_fallback(prompt: str, system_prompt: Optional[str] = None) -> str:
@@ -369,7 +416,7 @@ def call_gemini_fallback(prompt: str, system_prompt: Optional[str] = None) -> st
 
     sys_content = system_prompt or DEFAULT_STRICT_RAG_SYSTEM_PROMPT
 
-    conn = http.client.HTTPSConnection("generativelanguage.googleapis.com")
+    conn = http.client.HTTPSConnection("generativelanguage.googleapis.com", timeout=30.0)
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [
@@ -391,11 +438,37 @@ def call_gemini_fallback(prompt: str, system_prompt: Optional[str] = None) -> st
         conn.request("POST", f"/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}", json.dumps(payload), headers)
         res = conn.getresponse()
         data = res.read().decode("utf-8")
+
+        if res.status != 200:
+            error_msg = f"Gemini API error (HTTP {res.status})"
+            try:
+                err_json = json.loads(data)
+                if "error" in err_json and "message" in err_json["error"]:
+                    error_msg += f": {err_json['error']['message']}"
+            except Exception:
+                pass
+            print(f"Gemini API call failed: {error_msg}")
+            raise RuntimeError(error_msg)
+
         response_json = json.loads(data)
-        return response_json["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = response_json.get("candidates")
+        if not candidates or not isinstance(candidates, list):
+            raise RuntimeError("Gemini API returned no candidate responses.")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts or not isinstance(parts, list) or "text" not in parts[0]:
+            raise RuntimeError("Gemini API candidate contained no text parts.")
+
+        text = parts[0]["text"]
+        if not text or not text.strip():
+            raise RuntimeError("Gemini API returned empty text.")
+
+        return text.strip()
     except Exception as e:
         print(f"Gemini API fallback failed: {e}")
         raise e
+    finally:
+        conn.close()
 
 
 def is_historical_patient_query(query: str) -> bool:
@@ -896,33 +969,31 @@ def query_pipeline(
     # 1. DIRECT LLM Mode — Genuinely bypasses FAISS, BM25, RRF, Reranker, NLI, and Citations
     if direct_llm:
         answer = ""
-        using_mock = False
 
         if GROQ_API_KEY:
             try:
                 answer = call_groq_llm(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
             except Exception as e_groq:
+                print(f"Direct LLM Groq call failed: {e_groq}. Attempting Gemini fallback...")
                 gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
                 if gemini_key:
                     try:
                         answer = call_gemini_fallback(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
-                    except Exception:
-                        answer = "Direct LLM response: Unable to contact LLM provider. Please check network or API configuration."
-                        using_mock = True
+                    except Exception as e_gemini:
+                        print(f"Direct LLM Gemini fallback failed: {e_gemini}.")
+                        answer = "Direct LLM response: Language model service is temporarily unavailable. Please try again shortly."
                 else:
-                    answer = f"Direct LLM Error: {str(e_groq)}"
-                    using_mock = True
+                    answer = "Direct LLM response: Language model service is temporarily unavailable. Please try again shortly."
         else:
             gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
             if gemini_key:
                 try:
                     answer = call_gemini_fallback(query, system_prompt=DEFAULT_DIRECT_LLM_SYSTEM_PROMPT)
-                except Exception:
-                    answer = "Direct LLM Mode: External API unavailable."
-                    using_mock = True
+                except Exception as e_gemini:
+                    print(f"Direct LLM Gemini failed: {e_gemini}.")
+                    answer = "Direct LLM response: Language model service is temporarily unavailable. Please try again shortly."
             else:
-                answer = "Direct LLM Mode: No API keys configured. LLM generation unavailable."
-                using_mock = True
+                answer = "Direct LLM Mode: No language model API keys configured. Generation unavailable."
 
         return {
             "answer": answer.strip() if answer else "",
@@ -934,7 +1005,7 @@ def query_pipeline(
             "total_claims": 0,
             "evidence": [],
             "verification_results": [],
-            "using_mock": using_mock,
+            "using_mock": False,
             "grounded": False,
             "citations": [],
             "retrieval": {}
@@ -972,6 +1043,7 @@ def query_pipeline(
 
     # 4. Scope & Document Status Filtering
     patient_id_filter = (filters.get("patient_id") if filters else None) or clinical_entities.get("patient_id")
+    is_patient_scope = bool(filters and filters.get("scope") == "patient")
     is_historical = is_historical_patient_query(query)
 
     latest_report_id = None
@@ -1038,10 +1110,10 @@ def query_pipeline(
         scope_desc = filters.get("scope", "requested") if filters else "requested"
         return {
             "answer": f"No active documents could be retrieved for the {scope_desc} scope. Please check document approval status.",
-            "confidence_level": "Low",
-            "confidence_score": 0.0,
-            "grounding_level": "Not Supported",
-            "grounding_coverage": "0 of 0 claims supported",
+            "confidence_level": None if is_patient_scope else "Low",
+            "confidence_score": None if is_patient_scope else 0.0,
+            "grounding_level": None if is_patient_scope else "Not Supported",
+            "grounding_coverage": "" if is_patient_scope else "0 of 0 claims supported",
             "supported_claims": 0,
             "total_claims": 0,
             "evidence": [],
@@ -1145,10 +1217,10 @@ def query_pipeline(
                 "Insufficient evidence in the hospital knowledge base to answer this question reliably. "
                 "Please consult hospital clinical protocols or an attending specialist directly."
             ),
-            "confidence_level": "Low",
-            "confidence_score": 0.0,
-            "grounding_level": "Not Supported",
-            "grounding_coverage": "0 of 0 claims supported",
+            "confidence_level": None if is_patient_scope else "Low",
+            "confidence_score": None if is_patient_scope else 0.0,
+            "grounding_level": None if is_patient_scope else "Not Supported",
+            "grounding_coverage": "" if is_patient_scope else "0 of 0 claims supported",
             "supported_claims": 0,
             "total_claims": 0,
             "evidence": [],
@@ -1227,65 +1299,94 @@ CLINICAL RESPONSE (STRICTLY GROUNDED CDSS):"""
 
     t_gen_start = time.time()
     answer = ""
-    using_mock = False
+    generation_unavailable = False
 
     if GROQ_API_KEY:
         try:
             answer = call_groq_llm(prompt, system_prompt=DEFAULT_STRICT_RAG_SYSTEM_PROMPT)
-        except Exception:
+        except Exception as e_groq:
+            print(f"Groq generation failed: {e_groq}. Attempting Gemini fallback...")
             gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
             if gemini_key:
                 try:
                     answer = call_gemini_fallback(prompt, system_prompt=DEFAULT_STRICT_RAG_SYSTEM_PROMPT)
-                except Exception:
-                    answer = generate_mock_answer(query, top_chunks)
-                    using_mock = True
+                except Exception as e_gemini:
+                    print(f"Gemini fallback failed: {e_gemini}. All LLM providers unavailable.")
+                    answer = SERVICE_UNAVAILABLE_MESSAGE
+                    generation_unavailable = True
             else:
-                answer = generate_mock_answer(query, top_chunks)
-                using_mock = True
+                print("Gemini API key not configured. All LLM providers unavailable.")
+                answer = SERVICE_UNAVAILABLE_MESSAGE
+                generation_unavailable = True
     else:
         gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if gemini_key:
             try:
                 answer = call_gemini_fallback(prompt, system_prompt=DEFAULT_STRICT_RAG_SYSTEM_PROMPT)
-            except Exception:
-                answer = generate_mock_answer(query, top_chunks)
-                using_mock = True
+            except Exception as e_gemini:
+                print(f"Gemini generation failed: {e_gemini}. All LLM providers unavailable.")
+                answer = SERVICE_UNAVAILABLE_MESSAGE
+                generation_unavailable = True
         else:
-            answer = generate_mock_answer(query, top_chunks)
-            using_mock = True
+            print("No LLM API keys configured. All LLM providers unavailable.")
+            answer = SERVICE_UNAVAILABLE_MESSAGE
+            generation_unavailable = True
     t_gen_end = time.time()
 
-    # 13. NLI Sentence-Level Fact Verification Engine
-    nli_results = validate_response_with_nli(
-        answer=answer,
-        context_chunks=top_chunks,
-        embedder=embedder,
-        cross_encoder=get_cross_encoder_model(),
-        similarity_threshold_entailment=SIMILARITY_THRESHOLD_SUPPORTED,
-        similarity_threshold_partial=SIMILARITY_THRESHOLD_PARTIAL
-    )
-
-    # 14. RBAC Permission Filtering for Evidence & Citations
-    permitted_evidence = filter_citations_by_permission(nli_results["evidence"], user_role)
-
-    final_answer = answer
-    if nli_results.get("contradiction_count", 0) > 0:
-        final_answer = (
-            "The retrieved clinical evidence contains conflicting or contradictory findings regarding this question. "
-            "Please review the official hospital guideline documents directly."
+    # 13. NLI Sentence-Level Fact Verification Engine (only if generation succeeded)
+    if not generation_unavailable and answer and answer != SERVICE_UNAVAILABLE_MESSAGE:
+        nli_results = validate_response_with_nli(
+            answer=answer,
+            context_chunks=top_chunks,
+            embedder=embedder,
+            cross_encoder=get_cross_encoder_model(),
+            similarity_threshold_entailment=SIMILARITY_THRESHOLD_SUPPORTED,
+            similarity_threshold_partial=SIMILARITY_THRESHOLD_PARTIAL
         )
-    elif (
-        nli_results.get("grounding_level") == "Not Supported"
-        and nli_results.get("supported_claims", 0) == 0
-        and nli_results.get("total_claims", 0) > 0
-        and nli_results.get("confidence_score", 0.0) < 0.35
-        and not using_mock
-    ):
-        final_answer = (
-            "Insufficient evidence in the hospital knowledge base to answer this question reliably. "
-            "(Clinical safety safeguard: ungrounded claims are suppressed.)"
-        )
+
+        permitted_evidence = filter_citations_by_permission(nli_results["evidence"], user_role)
+
+        final_answer = answer
+        if nli_results.get("contradiction_count", 0) > 0:
+            final_answer = (
+                "The retrieved clinical evidence contains conflicting or contradictory findings regarding this question. "
+                "Please review the official hospital guideline documents directly."
+            )
+        elif (
+            nli_results.get("grounding_level") == "Not Supported"
+            and nli_results.get("supported_claims", 0) == 0
+            and nli_results.get("total_claims", 0) > 0
+            and nli_results.get("confidence_score", 0.0) < 0.35
+        ):
+            final_answer = (
+                "Insufficient evidence in the hospital knowledge base to answer this question reliably. "
+                "(Clinical safety safeguard: ungrounded claims are suppressed.)"
+            )
+
+        conf_level = None if is_patient_scope else nli_results["confidence_level"]
+        conf_score = None if is_patient_scope else nli_results["confidence_score"]
+        ground_level = None if is_patient_scope else nli_results.get("grounding_level", "Partially Supported")
+        ground_cov = "" if is_patient_scope else nli_results.get("grounding_coverage", "")
+        sup_claims = nli_results.get("supported_claims", 0)
+        tot_claims = nli_results.get("total_claims", 0)
+        ver_results = nli_results["verification_results"]
+        ent_count = nli_results.get("entailment_count", 0)
+        neut_count = nli_results.get("neutral_count", 0)
+        contra_count = nli_results.get("contradiction_count", 0)
+    else:
+        # LLM generation unavailable: return clean service message with no fake confidence
+        final_answer = SERVICE_UNAVAILABLE_MESSAGE
+        conf_level = None
+        conf_score = None
+        ground_level = None
+        ground_cov = ""
+        sup_claims = 0
+        tot_claims = 0
+        permitted_evidence = []
+        ver_results = []
+        ent_count = 0
+        neut_count = 0
+        contra_count = 0
 
     total_latency_ms = round((time.time() - t0) * 1000, 1)
 
@@ -1305,19 +1406,19 @@ CLINICAL RESPONSE (STRICTLY GROUNDED CDSS):"""
 
     return {
         "answer": final_answer,
-        "confidence_level": nli_results["confidence_level"],
-        "confidence_score": nli_results["confidence_score"],
-        "grounding_level": nli_results.get("grounding_level", "Partially Supported"),
-        "grounding_coverage": nli_results.get("grounding_coverage", ""),
-        "supported_claims": nli_results.get("supported_claims", 0),
-        "total_claims": nli_results.get("total_claims", 0),
+        "confidence_level": conf_level,
+        "confidence_score": conf_score,
+        "grounding_level": ground_level,
+        "grounding_coverage": ground_cov,
+        "supported_claims": sup_claims,
+        "total_claims": tot_claims,
         "evidence": permitted_evidence,
-        "verification_results": nli_results["verification_results"],
-        "using_mock": using_mock,
-        "entailment_count": nli_results.get("entailment_count", 0),
-        "neutral_count": nli_results.get("neutral_count", 0),
-        "contradiction_count": nli_results.get("contradiction_count", 0),
+        "verification_results": ver_results,
+        "using_mock": False,
+        "entailment_count": ent_count,
+        "neutral_count": neut_count,
+        "contradiction_count": contra_count,
         "retrieval": telemetry,
-        "grounded": (nli_results.get("grounding_level") in ["Strongly Supported", "Partially Supported"]),
+        "grounded": (ground_level in ["Strongly Supported", "Partially Supported"]),
         "citations": structured_citations
     }

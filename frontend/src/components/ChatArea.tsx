@@ -267,13 +267,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   }`}>
                     {/* Metadata Header for Assistant (Strict RAG mode only) */}
                     {!isUser && (
-                      (m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level)) ||
+                      (!selectedPatientId && m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level)) ||
                       (m.sources && m.sources.length > 0)
                     ) && (
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-1 border-b border-slate-100 text-xs">
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-slate-800 text-xs">Clinical Decision Assistant</span>
-                          {m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level) && (
+                          {!selectedPatientId && m.confidence_score !== null && m.confidence_score !== undefined && Boolean(m.confidence_level) && (
                             <ConfidencePill
                               level={m.confidence_level}
                               score={m.confidence_score}

@@ -185,6 +185,8 @@ class PersistentBM25Index:
                     instance.idf = data["idf"]
                     instance.N = data["N"]
                     instance.avgdl = data["avgdl"]
+                if fallback_chunks and instance.N != len(fallback_chunks):
+                    instance.build_index(fallback_chunks)
                 return instance
             except Exception as e:
                 print(f"Warning: Could not read BM25 index from disk: {e}. Reinitializing.")
@@ -213,10 +215,14 @@ class DenseRetriever:
             return []
 
         if embeddings_array is not None and len(embeddings_array) > 0:
-            filtered_embeddings = embeddings_array[filtered_indices]
+            # Defensive bounds validation: ensure all candidate indices are within valid row dimensions
+            valid_indices = [idx for idx in filtered_indices if 0 <= idx < len(embeddings_array)]
+            if not valid_indices:
+                return []
+            filtered_embeddings = embeddings_array[valid_indices]
             # Ensure 2D float32 normalized vectors
             scores = np.dot(filtered_embeddings, query_vector[0])
-            scored_candidates = [(filtered_indices[i], float(scores[i])) for i in range(len(filtered_indices))]
+            scored_candidates = [(valid_indices[i], float(scores[i])) for i in range(len(valid_indices))]
         else:
             # Fallback direct FAISS search
             k_search = min(top_k * 2, faiss_index.ntotal)
@@ -226,7 +232,7 @@ class DenseRetriever:
             scored_candidates = []
             target_set = set(filtered_indices)
             for dist, idx in zip(D[0], I[0]):
-                if idx in target_set:
+                if idx in target_set and idx >= 0:
                     scored_candidates.append((int(idx), float(dist)))
 
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
@@ -308,13 +314,14 @@ class CrossEncoderReranker:
         prepared = []
         for cand in candidates:
             idx = cand["chunk_index"]
-            chunk = chunks_metadata[idx].copy()
-            chunk["rrf_score"] = cand["rrf_score"]
-            chunk["dense_score"] = cand["dense_score"]
-            chunk["bm25_score"] = cand["bm25_score"]
-            chunk["dense_rank"] = cand["dense_rank"]
-            chunk["bm25_rank"] = cand["bm25_rank"]
-            prepared.append(chunk)
+            if 0 <= idx < len(chunks_metadata):
+                chunk = chunks_metadata[idx].copy()
+                chunk["rrf_score"] = cand["rrf_score"]
+                chunk["dense_score"] = cand["dense_score"]
+                chunk["bm25_score"] = cand["bm25_score"]
+                chunk["dense_rank"] = cand["dense_rank"]
+                chunk["bm25_rank"] = cand["bm25_rank"]
+                prepared.append(chunk)
 
         cross_encoder = get_cross_encoder_model() if RAG_ENABLE_RERANKER else None
 
