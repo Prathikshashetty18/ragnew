@@ -20,7 +20,13 @@ MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "25"))
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 # Database Configurations
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./clinical_rag_v2.db")
+DEFAULT_SQLITE_PATH = os.path.normpath(os.path.join(BASE_DIR, "clinical_rag_v2.db")).replace("\\", "/")
+DEFAULT_DATABASE_URL = f"sqlite:///{DEFAULT_SQLITE_PATH}"
+DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+
+# Server Network Configuration (Defaults for deployment / CLI)
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8000"))
 
 # Environment Mode & Origins
 ENVIRONMENT = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", "development")).lower()
@@ -59,6 +65,8 @@ ADMIN_DEFAULT_PASSWORD = os.environ.get("ADMIN_DEFAULT_PASSWORD", "Admin@123")
 # LLM & Embedding Model Configurations
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 RERANK_MODEL_NAME = os.environ.get("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 RAG_RERANKER_MODEL = RERANK_MODEL_NAME

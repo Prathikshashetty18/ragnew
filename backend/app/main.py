@@ -253,6 +253,14 @@ class SessionCreate(BaseModel):
 
 # ----------------- PUBLIC ENDPOINTS -----------------
 
+@app.get("/")
+@app.get("/health")
+def root_health_check():
+    return {
+        "status": "healthy",
+        "service": "Clinical RAG Hospital CDSS"
+    }
+
 @app.get("/api/health")
 def health_check():
     return {
