@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Upload, CheckCircle, Check, Archive, Trash2 } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { DocumentItem, User } from "../types";
 
 interface KnowledgeBaseViewProps {
@@ -18,7 +19,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
 
   const fetchDocs = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/documents?scope=knowledge_base", {
+      const res = await fetch(getApiUrl("/api/documents?scope=knowledge_base"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -47,7 +48,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
     formData.append("document_type", docType);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/upload", {
+      const res = await fetch(getApiUrl("/api/upload"), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
         body: formData,
@@ -70,7 +71,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
 
   const handleApprove = async (id: number) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/documents/${id}/approve`, {
+      const res = await fetch(getApiUrl(`/api/documents/${id}/approve`), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -84,7 +85,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
 
   const handleArchive = async (id: number) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/documents/${id}/archive`, {
+      const res = await fetch(getApiUrl(`/api/documents/${id}/archive`), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -99,7 +100,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
   const handleDelete = async (id: number) => {
     if (!window.confirm("Are you sure you want to permanently delete this document and remove all associated indexed chunks?")) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/documents/${id}`, {
+      const res = await fetch(getApiUrl(`/api/documents/${id}`), {
         method: "DELETE",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -198,7 +199,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({ currentUse
                 <tr key={d.id} className="hover:bg-slate-50/80 transition">
                   <td className="p-4 font-semibold text-slate-900">
                     <a
-                      href={`http://127.0.0.1:8000/api/documents/${d.id}/file`}
+                      href={getApiUrl(`/api/documents/${d.id}/file`)}
                       target="_blank"
                       rel="noreferrer"
                       className="hover:text-rose-900 underline"

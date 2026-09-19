@@ -10,6 +10,7 @@ import { KnowledgeBaseView } from "./components/KnowledgeBaseView";
 import { UserManagement } from "./components/UserManagement";
 import { AuditLogView } from "./components/AuditLogView";
 import { DashboardHome } from "./components/DashboardHome";
+import { getApiUrl } from "./api/client";
 import type { User, Patient, ChatSession, ChatMessage, SourceCard } from "./types";
 
 export const App: React.FC = () => {
@@ -26,7 +27,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     const token = localStorage.getItem("cdss_token");
     if (token) {
-      fetch("http://127.0.0.1:8000/api/auth/me", {
+      fetch(getApiUrl("/api/auth/me"), {
         headers: { Authorization: `Bearer ${token}` },
       })
         .then((res) => (res.ok ? res.json() : null))
@@ -39,7 +40,7 @@ export const App: React.FC = () => {
 
   const fetchPatients = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/patients", {
+      const res = await fetch(getApiUrl("/api/patients"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -51,7 +52,7 @@ export const App: React.FC = () => {
 
   const fetchSessions = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
+      const res = await fetch(getApiUrl("/api/sessions"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -67,7 +68,7 @@ export const App: React.FC = () => {
 
   const fetchMessages = async (sessionId: string) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/sessions/${sessionId}/messages`, {
+      const res = await fetch(getApiUrl(`/api/sessions/${sessionId}/messages`), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -119,7 +120,7 @@ export const App: React.FC = () => {
 
   const handleNewChat = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
+      const res = await fetch(getApiUrl("/api/sessions"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -144,7 +145,7 @@ export const App: React.FC = () => {
 
   const handleDeleteSession = async (id: string) => {
     try {
-      await fetch(`http://127.0.0.1:8000/api/sessions/${id}`, {
+      await fetch(getApiUrl(`/api/sessions/${id}`), {
         method: "DELETE",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -165,7 +166,7 @@ export const App: React.FC = () => {
   const handleSendMessage = async (query: string, directLlm: boolean, attachedDocId?: number) => {
     let currentSessionId = activeSessionId;
     if (!currentSessionId) {
-      const res = await fetch("http://127.0.0.1:8000/api/sessions", {
+      const res = await fetch(getApiUrl("/api/sessions"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -202,7 +203,7 @@ export const App: React.FC = () => {
     abortControllerRef.current = controller;
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/ask", {
+      const res = await fetch(getApiUrl("/api/ask"), {
         method: "POST",
         signal: controller.signal,
         headers: {

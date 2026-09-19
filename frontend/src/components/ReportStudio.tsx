@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Sparkles, CheckCircle, Printer, Save } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { Patient, ClinicalReport } from "../types";
 
 interface ReportStudioProps {
@@ -25,7 +26,7 @@ export const ReportStudio: React.FC<ReportStudioProps> = ({ patients }) => {
     setSuccessMsg(null);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/reports/generate", {
+      const res = await fetch(getApiUrl("/api/reports/generate"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -55,7 +56,7 @@ export const ReportStudio: React.FC<ReportStudioProps> = ({ patients }) => {
   const handleSaveDraft = async () => {
     if (!currentReport) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/reports/${currentReport.id}`, {
+      const res = await fetch(getApiUrl(`/api/reports/${currentReport.id}`), {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
@@ -74,7 +75,7 @@ export const ReportStudio: React.FC<ReportStudioProps> = ({ patients }) => {
   const handleApprove = async () => {
     if (!currentReport) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/reports/${currentReport.id}/approve`, {
+      const res = await fetch(getApiUrl(`/api/reports/${currentReport.id}/approve`), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });

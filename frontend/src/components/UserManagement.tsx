@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { UserPlus, CheckCircle, Edit3, X } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { User } from "../types";
 import { DOCTOR_SPECIALTIES } from "../types";
 
@@ -21,7 +22,7 @@ export const UserManagement: React.FC = () => {
 
   const fetchUsers = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/users", {
+      const res = await fetch(getApiUrl("/api/users"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -43,7 +44,7 @@ export const UserManagement: React.FC = () => {
     setSuccessMsg(null);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/users", {
+      const res = await fetch(getApiUrl("/api/users"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -85,7 +86,7 @@ export const UserManagement: React.FC = () => {
     if (!editingDoctor) return;
     setLoading(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/users/${editingDoctor.id}`, {
+      const res = await fetch(getApiUrl(`/api/users/${editingDoctor.id}`), {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -113,7 +114,7 @@ export const UserManagement: React.FC = () => {
   const handleToggleStatus = async (user: User) => {
     const nextStatus = user.status === "ACTIVE" ? "INACTIVE" : "ACTIVE";
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/users/${user.id}/status?status=${nextStatus}`, {
+      const res = await fetch(getApiUrl(`/api/users/${user.id}/status?status=${nextStatus}`), {
         method: "PATCH",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -133,7 +134,7 @@ export const UserManagement: React.FC = () => {
       return;
     }
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/users/${user.id}`, {
+      const res = await fetch(getApiUrl(`/api/users/${user.id}`), {
         method: "DELETE",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });

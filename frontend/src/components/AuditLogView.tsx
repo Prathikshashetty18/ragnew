@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { getApiUrl } from "../api/client";
 import type { AuditLogItem } from "../types";
 
 export const AuditLogView: React.FC = () => {
@@ -6,7 +7,7 @@ export const AuditLogView: React.FC = () => {
 
   const fetchLogs = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/audit-logs?limit=100", {
+      const res = await fetch(getApiUrl("/api/audit-logs?limit=100"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {

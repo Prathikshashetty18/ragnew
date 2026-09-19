@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { FileText, ExternalLink } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { DocumentItem, User } from "../types";
 
 interface DocumentLibraryProps {
@@ -12,7 +13,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({ currentUser })
 
   const fetchDocs = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/documents", {
+      const res = await fetch(getApiUrl("/api/documents"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -30,7 +31,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({ currentUser })
 
   const handleArchive = async (id: number) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/documents/${id}/archive`, {
+      const res = await fetch(getApiUrl(`/api/documents/${id}/archive`), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
@@ -83,7 +84,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({ currentUser })
                   <td className="p-4 font-mono">{d.chunk_count}</td>
                   <td className="p-4 text-right space-x-3">
                     <a
-                      href={`http://127.0.0.1:8000/api/documents/${d.id}/file`}
+                      href={getApiUrl(`/api/documents/${d.id}/file`)}
                       target="_blank"
                       rel="noreferrer"
                       className="text-rose-900 hover:text-rose-700 font-semibold inline-flex items-center gap-1"

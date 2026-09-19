@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Image as ImageIcon, Upload, CheckCircle, AlertCircle, Trash2 } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { Patient, RadiologyRecord } from "../types";
 
 interface RadiologyWorkspaceProps {
@@ -18,7 +19,7 @@ export const RadiologyWorkspace: React.FC<RadiologyWorkspaceProps> = ({ patients
 
   const fetchRecords = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/radiology", {
+      const res = await fetch(getApiUrl("/api/radiology"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -37,7 +38,7 @@ export const RadiologyWorkspace: React.FC<RadiologyWorkspaceProps> = ({ patients
   const handleDeleteRecord = async (recordId: number) => {
     if (!window.confirm("Are you sure you want to delete this radiology report?")) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/radiology/${recordId}`, {
+      const res = await fetch(getApiUrl(`/api/radiology/${recordId}`), {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -73,7 +74,7 @@ export const RadiologyWorkspace: React.FC<RadiologyWorkspaceProps> = ({ patients
     if (file) formData.append("file", file);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/radiology/upload", {
+      const res = await fetch(getApiUrl("/api/radiology/upload"), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
         body: formData,

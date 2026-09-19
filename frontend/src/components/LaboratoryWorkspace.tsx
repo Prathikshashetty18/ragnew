@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { TestTube, Upload, CheckCircle, Trash2 } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { Patient, LabResult } from "../types";
 
 interface LaboratoryWorkspaceProps {
@@ -20,7 +21,7 @@ export const LaboratoryWorkspace: React.FC<LaboratoryWorkspaceProps> = ({ patien
 
   const fetchRecords = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/laboratory", {
+      const res = await fetch(getApiUrl("/api/laboratory"), {
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
       });
       if (res.ok) {
@@ -39,7 +40,7 @@ export const LaboratoryWorkspace: React.FC<LaboratoryWorkspaceProps> = ({ patien
   const handleDeleteRecord = async (recordId: number) => {
     if (!window.confirm("Are you sure you want to delete this laboratory panel?")) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/laboratory/${recordId}`, {
+      const res = await fetch(getApiUrl(`/api/laboratory/${recordId}`), {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -77,7 +78,7 @@ export const LaboratoryWorkspace: React.FC<LaboratoryWorkspaceProps> = ({ patien
     if (file) formData.append("file", file);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/laboratory/upload", {
+      const res = await fetch(getApiUrl("/api/laboratory/upload"), {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}` },
         body: formData,

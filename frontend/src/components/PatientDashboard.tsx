@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Activity, UserPlus, CheckCircle, UserCheck, Stethoscope, RefreshCw, HeartPulse, PlusCircle, Clock, X, Trash2 } from "lucide-react";
+import { getApiUrl } from "../api/client";
 import type { Patient, User, PatientVitals } from "../types";
 import { DOCTOR_SPECIALTIES } from "../types";
 
@@ -86,7 +87,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   // Fetch active doctors for assignment dropdowns
   const fetchDoctors = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/doctors", {
+      const res = await fetch(getApiUrl("/api/doctors"), {
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
         },
@@ -103,7 +104,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
   const fetchPatientVitals = async (patientId: string) => {
     setLoadingVitals(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/patients/${patientId}/vitals`, {
+      const res = await fetch(getApiUrl(`/api/patients/${patientId}/vitals`), {
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
         },
@@ -151,7 +152,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
       if (vIntakeOutput.trim()) payload.intake_output = vIntakeOutput.trim();
       if (vNotes.trim()) payload.notes = vNotes.trim();
 
-      const res = await fetch(`http://127.0.0.1:8000/api/patients/${vitalsPatient.id}/vitals`, {
+      const res = await fetch(getApiUrl(`/api/patients/${vitalsPatient.id}/vitals`), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -188,7 +189,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
     if (!vitalsPatient) return;
     if (!window.confirm("Are you sure you want to delete this vitals record?")) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/patients/${vitalsPatient.id}/vitals/${vitalsId}`, {
+      const res = await fetch(getApiUrl(`/api/patients/${vitalsPatient.id}/vitals/${vitalsId}`), {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -229,7 +230,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
         payload.assigned_doctor_id = parseInt(assignedDoctorId);
       }
 
-      const res = await fetch("http://127.0.0.1:8000/api/patients", {
+      const res = await fetch(getApiUrl("/api/patients"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -264,7 +265,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
 
     setLoading(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/patients/${reassignPatient.id}`, {
+      const res = await fetch(getApiUrl(`/api/patients/${reassignPatient.id}`), {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -298,7 +299,7 @@ export const PatientDashboard: React.FC<PatientDashboardProps> = ({
     }
     setLoading(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/patients/${patient.id}`, {
+      const res = await fetch(getApiUrl(`/api/patients/${patient.id}`), {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,

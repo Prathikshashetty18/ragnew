@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { ConfidencePill } from "./ConfidencePill";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { getApiUrl } from "../api/client";
 import type { ChatMessage, Patient, SourceCard } from "../types";
 
 interface ChatAreaProps {
@@ -68,7 +69,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     formData.append("document_type", "Patient Clinical Document");
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/upload", {
+      const res = await fetch(getApiUrl("/api/upload"), {
         method: "POST",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -96,7 +97,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       fileInputRef.current.value = "";
     }
     try {
-      await fetch(`http://127.0.0.1:8000/api/chat/attachments/${docId}`, {
+      await fetch(getApiUrl(`/api/chat/attachments/${docId}`), {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${localStorage.getItem("cdss_token") || ""}`,
@@ -443,7 +444,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
                   {src.view_url && (
                     <a
-                      href={`http://127.0.0.1:8000${src.view_url}`}
+                      href={getApiUrl(src.view_url)}
                       target="_blank"
                       rel="noreferrer"
                       className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-rose-900 hover:text-rose-700"
