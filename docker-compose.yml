@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: clinical-rag-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - ENVIRONMENT=development
+      - HOST=0.0.0.0
+      - PORT=8000
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev_insecure_jwt_secret_do_not_use_in_production}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000
+      - DATABASE_URL=sqlite:////app/data/clinical_rag_v2.db
+      - UPLOAD_DIR=/app/data/uploads
+      - VECTOR_STORE_DIR=/app/data/vector_store
+    restart: unless-stopped

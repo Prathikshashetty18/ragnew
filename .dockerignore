@@ -1,0 +1,50 @@
+# Version control
+.git/
+.gitignore
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases & storage
+*.db
+*.sqlite
+*.sqlite3
+clinical_rag_v2.db
+clinical_rag.db
+cdss.db
+data/
+backend/*.db
+backend/uploads/
+backend/vector_store/
+
+# Local environment & secret files
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+
+# Frontend build & dependencies (Backend image does not bundle frontend)
+frontend/
+node_modules/
+dist/
+
+# Test & scratch temporary artifacts
+backend/test_*.pdf
+backend/test_gen*.pdf
+backend/test_exact.pdf
+backend/test_pure.pdf
+scratch/
