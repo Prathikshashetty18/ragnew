@@ -2,8 +2,57 @@ import os
 import re
 import hashlib
 from typing import Dict, Any, Tuple
+from fastapi import HTTPException, status, Request, UploadFile
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
+
+def check_content_length(request: Request, max_bytes: int) -> None:
+    """
+    Pre-checks Content-Length header if present.
+    If Content-Length > max_bytes, immediately raises HTTP 413 Payload Too Large
+    without reading the request body.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            cl = int(content_length)
+            if cl > max_bytes:
+                max_mb = max_bytes / (1024 * 1024)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Uploaded file exceeds the maximum allowed size of {max_mb:.0f} MB."
+                )
+        except ValueError:
+            pass
+
+async def read_upload_file_with_limit(
+    file: UploadFile,
+    max_bytes: int,
+    chunk_size: int = 64 * 1024
+) -> bytes:
+    """
+    Reads an UploadFile in bounded chunks (default 64 KB) up to max_bytes.
+    Enforces the size limit strictly during reading. If cumulative byte count exceeds
+    max_bytes, raises HTTP 413 Payload Too Large immediately without accumulating unlimited data in RAM.
+    Returns the accumulated bytes (guaranteed <= max_bytes).
+    """
+    chunks = []
+    bytes_read = 0
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        bytes_read += len(chunk)
+        if bytes_read > max_bytes:
+            max_mb = max_bytes / (1024 * 1024)
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Uploaded file exceeds the maximum allowed size of {max_mb:.0f} MB."
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 # Medical clinical lexicon for domain relevance evaluation
 CLINICAL_LEXICON = {

@@ -15,6 +15,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 os.makedirs(SEED_DIR, exist_ok=True)
 
+# Upload File Size Configuration
+MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "25"))
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
 # Database Configurations
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./clinical_rag_v2.db")
 

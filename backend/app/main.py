@@ -5,14 +5,14 @@ import shutil
 import random
 from typing import List, Optional, Literal
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query
+from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES, ALLOWED_ORIGINS
+from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES, ALLOWED_ORIGINS, MAX_UPLOAD_SIZE_MB, MAX_UPLOAD_SIZE_BYTES
 from app.database import (
     get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, 
     PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, 
@@ -24,7 +24,8 @@ from app.auth import (
 )
 from app.document_validator import (
     validate_pdf_structure, evaluate_medical_relevance, 
-    detect_version_and_duplicates, compute_md5
+    detect_version_and_duplicates, compute_md5,
+    check_content_length, read_upload_file_with_limit
 )
 from app.rag_pipeline import (
     process_pdf, query_pipeline, remove_document_from_vector_store
@@ -898,6 +899,7 @@ def list_laboratory_records(
 
 @app.post("/api/laboratory/upload")
 async def upload_laboratory_record(
+    request: Request,
     background_tasks: BackgroundTasks,
     patient_id: str = Form(...),
     hemoglobin: Optional[str] = Form(None),
@@ -940,6 +942,41 @@ async def upload_laboratory_record(
     crp_val = crp if crp not in (None, "") else None
     notes_val = notes if notes not in (None, "") else None
 
+    # Process and validate attachment first before committing LabResult
+    doc_id = None
+    safe_name = None
+    temp_path = None
+    file_hash = None
+    version_info = None
+
+    if file and file.filename:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported for laboratory attachments.")
+            
+        check_content_length(request, MAX_UPLOAD_SIZE_BYTES)
+        file_bytes = await read_upload_file_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
+
+        safe_name = os.path.basename(file.filename)
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+        temp_path = os.path.join(UPLOAD_DIR, safe_name)
+        
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+            
+        try:
+            valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+            if not valid_struct:
+                log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+                raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+                
+            file_hash = compute_md5(file_bytes)
+            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
+        except Exception:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+    # File is valid (or absent). Now commit LabResult and Document transactionally
     lab = LabResult(
         patient_id=patient_id,
         recorded_by=user.id,
@@ -950,62 +987,41 @@ async def upload_laboratory_record(
         notes=notes_val
     )
     db.add(lab)
+
+    db_doc = None
+    if file and file.filename and version_info and not version_info["is_duplicate"]:
+        db_doc = Document(
+            name=safe_name,
+            file_path=temp_path,
+            status="processing",
+            approval_status="ACTIVE",
+            version=version_info["version"],
+            medical_relevance_score=1.0,
+            hash_md5=file_hash,
+            scope="patient",
+            patient_id=patient_id,
+            uploaded_by=user.id,
+            uploader_role=user.role,
+            document_type="blood_report"
+        )
+        db.add(db_doc)
+
     db.commit()
     db.refresh(lab)
-    
-    doc_id = None
-    if file and file.filename:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported for laboratory attachments.")
-            
-        safe_name = os.path.basename(file.filename)
-        safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
-        temp_path = os.path.join(UPLOAD_DIR, safe_name)
+    if db_doc:
+        db.refresh(db_doc)
+        doc_id = db_doc.id
+        background_tasks.add_task(
+            bg_process_pdf_task,
+            temp_path,
+            safe_name,
+            db_doc.id,
+            "patient",
+            patient_id,
+            version_info["version"],
+            "blood_report"
+        )
         
-        file_bytes = await file.read()
-        with open(temp_path, "wb") as f:
-            f.write(file_bytes)
-            
-        valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-        if not valid_struct:
-            os.remove(temp_path)
-            log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-            raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
-            
-        file_hash = compute_md5(file_bytes)
-        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
-        
-        if not version_info["is_duplicate"]:
-            db_doc = Document(
-                name=safe_name,
-                file_path=temp_path,
-                status="processing",
-                approval_status="ACTIVE",
-                version=version_info["version"],
-                medical_relevance_score=1.0,
-                hash_md5=file_hash,
-                scope="patient",
-                patient_id=patient_id,
-                uploaded_by=user.id,
-                uploader_role=user.role,
-                document_type="blood_report"
-            )
-            db.add(db_doc)
-            db.commit()
-            db.refresh(db_doc)
-            doc_id = db_doc.id
-            
-            background_tasks.add_task(
-                bg_process_pdf_task,
-                temp_path,
-                safe_name,
-                db_doc.id,
-                "patient",
-                patient_id,
-                version_info["version"],
-                "blood_report"
-            )
-            
     log_audit_event(db, user, "LABORATORY_PANEL_RECORDED", "laboratory", str(lab.id), "SUCCESS", f"Recorded lab panel for patient {patient_id}")
     
     return {
@@ -1107,6 +1123,7 @@ def list_radiology_records(
 
 @app.post("/api/radiology/upload")
 async def upload_radiology_record(
+    request: Request,
     background_tasks: BackgroundTasks,
     patient_id: str = Form(...),
     modality: Optional[str] = Form("Chest X-Ray"),
@@ -1128,60 +1145,67 @@ async def upload_radiology_record(
         
     doc_id = None
     image_path = None
+    temp_path = None
     if file and file.filename:
+        check_content_length(request, MAX_UPLOAD_SIZE_BYTES)
+        file_bytes = await read_upload_file_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
+
         filename_lower = file.filename.lower()
         safe_name = os.path.basename(file.filename)
         safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
         temp_path = os.path.join(UPLOAD_DIR, safe_name)
         
-        file_bytes = await file.read()
         with open(temp_path, "wb") as f:
             f.write(file_bytes)
             
         if filename_lower.endswith(".pdf"):
-            valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-            if not valid_struct:
-                os.remove(temp_path)
-                log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-                raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+            try:
+                valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+                if not valid_struct:
+                    log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+                    raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+                    
+                file_hash = compute_md5(file_bytes)
+                version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
                 
-            file_hash = compute_md5(file_bytes)
-            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
-            
-            if not version_info["is_duplicate"]:
-                db_doc = Document(
-                    name=safe_name,
-                    file_path=temp_path,
-                    status="processing",
-                    approval_status="ACTIVE",
-                    version=version_info["version"],
-                    medical_relevance_score=1.0,
-                    hash_md5=file_hash,
-                    scope="patient",
-                    patient_id=patient_id,
-                    uploaded_by=user.id,
-                    uploader_role=user.role,
-                    document_type="radiology_report"
-                )
-                db.add(db_doc)
-                db.commit()
-                db.refresh(db_doc)
-                doc_id = db_doc.id
-                
-                background_tasks.add_task(
-                    bg_process_pdf_task,
-                    temp_path,
-                    safe_name,
-                    db_doc.id,
-                    "patient",
-                    patient_id,
-                    version_info["version"],
-                    "radiology_report"
-                )
-            else:
-                existing_doc = db.query(Document).filter(Document.hash_md5 == file_hash).first()
-                if existing_doc:
-                    doc_id = existing_doc.id
+                if not version_info["is_duplicate"]:
+                    db_doc = Document(
+                        name=safe_name,
+                        file_path=temp_path,
+                        status="processing",
+                        approval_status="ACTIVE",
+                        version=version_info["version"],
+                        medical_relevance_score=1.0,
+                        hash_md5=file_hash,
+                        scope="patient",
+                        patient_id=patient_id,
+                        uploaded_by=user.id,
+                        uploader_role=user.role,
+                        document_type="radiology_report"
+                    )
+                    db.add(db_doc)
+                    db.commit()
+                    db.refresh(db_doc)
+                    doc_id = db_doc.id
+                    
+                    background_tasks.add_task(
+                        bg_process_pdf_task,
+                        temp_path,
+                        safe_name,
+                        db_doc.id,
+                        "patient",
+                        patient_id,
+                        version_info["version"],
+                        "radiology_report"
+                    )
+                else:
+                    existing_doc = db.query(Document).filter(Document.hash_md5 == file_hash).first()
+                    if existing_doc:
+                        doc_id = existing_doc.id
+            except Exception:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
         else:
             image_path = temp_path
             
@@ -1417,6 +1441,7 @@ def get_documents(scope: Optional[str] = None, approval_status: Optional[str] = 
 
 @app.post("/api/upload")
 async def upload_file(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     scope: str = Form("knowledge_base"),
@@ -1442,6 +1467,9 @@ async def upload_file(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Invalid file type. Only PDF documents are supported.")
         
+    check_content_length(request, MAX_UPLOAD_SIZE_BYTES)
+    file_bytes = await read_upload_file_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
+
     safe_name = os.path.basename(file.filename)
     safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
     if scope == "temporary":
@@ -1456,30 +1484,31 @@ async def upload_file(
                 existing_name_doc.name = f"deleted_{existing_name_doc.id}_{existing_name_doc.name}"
                 db.commit()
     
-    file_bytes = await file.read()
     with open(temp_path, "wb") as f:
         f.write(file_bytes)
         
-    # 2. Automated PDF Structure & Text Check
-    valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-    if not valid_struct:
-        os.remove(temp_path)
-        log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-        raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
-        
-    # 3. Medical Relevance Evaluation
-    relevance_data = evaluate_medical_relevance(extracted_text)
-    if relevance_data["classification"] == "LOW" and scope == "knowledge_base":
-        os.remove(temp_path)
-        log_audit_event(db, user, "MEDICAL_RELEVANCE_REJECTED", "document", safe_name, "DENIED", relevance_data["reason"])
-        raise HTTPException(status_code=400, detail=f"Document Rejected: {relevance_data['reason']}")
-        
-    # 4. Duplicate & Version Check
-    file_hash = compute_md5(file_bytes)
-    version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope=scope)
-    if version_info["is_duplicate"]:
-        os.remove(temp_path)
-        raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
+    try:
+        # 2. Automated PDF Structure & Text Check
+        valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
+        if not valid_struct:
+            log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+            raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
+            
+        # 3. Medical Relevance Evaluation
+        relevance_data = evaluate_medical_relevance(extracted_text)
+        if relevance_data["classification"] == "LOW" and scope == "knowledge_base":
+            log_audit_event(db, user, "MEDICAL_RELEVANCE_REJECTED", "document", safe_name, "DENIED", relevance_data["reason"])
+            raise HTTPException(status_code=400, detail=f"Document Rejected: {relevance_data['reason']}")
+            
+        # 4. Duplicate & Version Check
+        file_hash = compute_md5(file_bytes)
+        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope=scope)
+        if version_info["is_duplicate"]:
+            raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
+    except Exception:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
         
     # 5. Approval Workflow state
     # Admin uploads are authoritative (ACTIVE immediately). Doctor uploads go to PENDING for review.
