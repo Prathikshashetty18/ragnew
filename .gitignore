@@ -1,0 +1,24 @@
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local application data
+backend/uploads/
+backend/vector_store/
+
+# Backups
+backups/
+
+# Migration artifacts
+s3_migration_summary.json

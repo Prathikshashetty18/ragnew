@@ -5,11 +5,21 @@ import secrets
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from app.config import DATABASE_URL, ADMIN_DEFAULT_PASSWORD
+from app.config import DATABASE_URL, ADMIN_DEFAULT_PASSWORD, TURSO_AUTH_TOKEN
 
 # Setup SQLAlchemy engine and session
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+db_url = DATABASE_URL
+if db_url.startswith("libsql://"):
+    db_url = db_url.replace("libsql://", "sqlite+libsql://", 1)
+
+connect_args = {"check_same_thread": False} if (db_url.startswith("sqlite") or db_url.startswith("libsql")) else {}
+if TURSO_AUTH_TOKEN and "libsql" in db_url:
+    connect_args["auth_token"] = TURSO_AUTH_TOKEN
+    if "secure=" not in db_url:
+        separator = "&" if "?" in db_url else "?"
+        db_url = f"{db_url}{separator}secure=true"
+
+engine = create_engine(db_url, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

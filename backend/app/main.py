@@ -3,16 +3,22 @@ import re
 import uuid
 import shutil
 import random
+import logging
 from typing import List, Optional, Literal
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Depends, BackgroundTasks, HTTPException, status, Form, Header, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES, ALLOWED_ORIGINS, MAX_UPLOAD_SIZE_MB, MAX_UPLOAD_SIZE_BYTES
+from app.config import (
+    UPLOAD_DIR, SEED_DIR, CDSS_API_KEY, GROQ_API_KEY, ROLES, DOCTOR_SPECIALTIES, 
+    ALLOWED_ORIGINS, MAX_UPLOAD_SIZE_MB, MAX_UPLOAD_SIZE_BYTES, STORAGE_BACKEND
+)
+from app.storage import get_storage, StorageFileNotFoundError, StorageError
+logger = logging.getLogger("clinical_rag.api")
 from app.database import (
     get_db, init_db, Document, ChatSession, ChatMessage, User, Patient, 
     PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, 
@@ -28,7 +34,8 @@ from app.document_validator import (
     check_content_length, read_upload_file_with_limit
 )
 from app.rag_pipeline import (
-    process_pdf, query_pipeline, remove_document_from_vector_store
+    process_pdf, query_pipeline, remove_document_from_vector_store,
+    get_indexed_document_ids
 )
 from app.report_generator import generate_ai_patient_report, sync_report_to_knowledge_base, reconcile_unindexed_clinical_reports
 
@@ -102,25 +109,25 @@ def startup_load_seeds():
         return
         
     db = next(get_db())
+    storage = get_storage()
     try:
+        indexed_doc_ids = get_indexed_document_ids()
         pdf_files = [f for f in os.listdir(SEED_DIR) if f.endswith(".pdf")]
         for filename in pdf_files:
             safe_name = os.path.basename(filename)
             safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
+            src_path = os.path.join(SEED_DIR, filename)
             
             existing = db.query(Document).filter(Document.name == safe_name).first()
             if not existing:
-                src_path = os.path.join(SEED_DIR, filename)
-                dest_path = os.path.join(UPLOAD_DIR, safe_name)
-                shutil.copy2(src_path, dest_path)
-                
-                with open(dest_path, "rb") as f:
+                with open(src_path, "rb") as f:
                     file_bytes = f.read()
                 file_hash = compute_md5(file_bytes)
+                stored_path = storage.upload(safe_name, file_bytes, content_type="application/pdf")
                 
                 doc = Document(
                     name=safe_name,
-                    file_path=dest_path,
+                    file_path=stored_path,
                     status="processing",
                     approval_status="ACTIVE",
                     version="1.0",
@@ -133,7 +140,7 @@ def startup_load_seeds():
                 db.refresh(doc)
                 
                 try:
-                    chunks = process_pdf(dest_path, safe_name, doc_id=doc.id, scope="knowledge_base", version="1.0", document_type="Guideline")
+                    chunks = process_pdf(stored_path, safe_name, doc_id=doc.id, scope="knowledge_base", version="1.0", document_type="Guideline")
                     doc.status = "completed"
                     doc.chunk_count = chunks
                     print(f"Pre-loaded guideline {safe_name} ({chunks} chunks).")
@@ -141,6 +148,31 @@ def startup_load_seeds():
                     print(f"Failed to process seed {safe_name}: {e}")
                     doc.status = "failed"
                 db.commit()
+            elif existing.id not in indexed_doc_ids and existing.approval_status not in ("DELETED", "ARCHIVED"):
+                # Database row exists, but its vectors are missing from the active vector store
+                print(f"Re-indexing missing vectors for guideline {safe_name} (doc_id={existing.id})...")
+                if not storage.exists(existing.file_path):
+                    with open(src_path, "rb") as f:
+                        file_bytes = f.read()
+                    existing.file_path = storage.upload(safe_name, file_bytes, content_type="application/pdf")
+                    db.commit()
+
+                try:
+                    chunks = process_pdf(
+                        file_path=existing.file_path,
+                        filename=safe_name,
+                        doc_id=existing.id,
+                        scope=existing.scope or "knowledge_base",
+                        patient_id=existing.patient_id,
+                        version=existing.version or "1.0",
+                        document_type=existing.document_type or "Guideline"
+                    )
+                    existing.status = "completed"
+                    existing.chunk_count = chunks
+                    db.commit()
+                    print(f"Successfully reconstituted {chunks} vectors for guideline {safe_name} (doc_id={existing.id}).")
+                except Exception as e:
+                    print(f"Failed to re-index seed guideline {safe_name}: {e}")
                 
         # Reconcile unindexed clinical reports into Knowledge Base
         reconcile_unindexed_clinical_reports(db)
@@ -256,17 +288,32 @@ class SessionCreate(BaseModel):
 @app.get("/")
 @app.get("/health")
 def root_health_check():
+    try:
+        _, metadata, _ = get_vector_store()
+        vector_store_chunks = len(metadata)
+    except Exception as e:
+        print(f"[HEALTH DEBUG ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        vector_store_chunks = 0
     return {
         "status": "healthy",
-        "service": "Clinical RAG Hospital CDSS"
+        "service": "Clinical RAG Hospital CDSS",
+        "vector_store_chunks": vector_store_chunks
     }
 
 @app.get("/api/health")
 def health_check():
+    try:
+        _, metadata, _ = get_vector_store()
+        vector_store_chunks = len(metadata)
+    except Exception:
+        vector_store_chunks = 0
     return {
         "status": "healthy",
         "service": "Clinical RAG Hospital CDSS",
         "groq_api_key_configured": bool(GROQ_API_KEY),
+        "vector_store_chunks": vector_store_chunks,
         "timestamp": datetime.utcnow()
     }
 
@@ -953,7 +1000,7 @@ async def upload_laboratory_record(
     # Process and validate attachment first before committing LabResult
     doc_id = None
     safe_name = None
-    temp_path = None
+    stored_path = None
     file_hash = None
     version_info = None
 
@@ -966,23 +1013,17 @@ async def upload_laboratory_record(
 
         safe_name = os.path.basename(file.filename)
         safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
-        temp_path = os.path.join(UPLOAD_DIR, safe_name)
         
-        with open(temp_path, "wb") as f:
-            f.write(file_bytes)
+        valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(file_bytes)
+        if not valid_struct:
+            log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+            raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
             
-        try:
-            valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-            if not valid_struct:
-                log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-                raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
-                
-            file_hash = compute_md5(file_bytes)
-            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
-        except Exception:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise
+        file_hash = compute_md5(file_bytes)
+        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
+
+        storage = get_storage()
+        stored_path = storage.upload(safe_name, file_bytes, content_type="application/pdf")
 
     # File is valid (or absent). Now commit LabResult and Document transactionally
     lab = LabResult(
@@ -1000,7 +1041,7 @@ async def upload_laboratory_record(
     if file and file.filename and version_info and not version_info["is_duplicate"]:
         db_doc = Document(
             name=safe_name,
-            file_path=temp_path,
+            file_path=stored_path,
             status="processing",
             approval_status="ACTIVE",
             version=version_info["version"],
@@ -1021,7 +1062,7 @@ async def upload_laboratory_record(
         doc_id = db_doc.id
         background_tasks.add_task(
             bg_process_pdf_task,
-            temp_path,
+            stored_path,
             safe_name,
             db_doc.id,
             "patient",
@@ -1153,7 +1194,6 @@ async def upload_radiology_record(
         
     doc_id = None
     image_path = None
-    temp_path = None
     if file and file.filename:
         check_content_length(request, MAX_UPLOAD_SIZE_BYTES)
         file_bytes = await read_upload_file_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
@@ -1161,61 +1201,55 @@ async def upload_radiology_record(
         filename_lower = file.filename.lower()
         safe_name = os.path.basename(file.filename)
         safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
-        temp_path = os.path.join(UPLOAD_DIR, safe_name)
+        storage = get_storage()
         
-        with open(temp_path, "wb") as f:
-            f.write(file_bytes)
-            
         if filename_lower.endswith(".pdf"):
-            try:
-                valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-                if not valid_struct:
-                    log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-                    raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
-                    
-                file_hash = compute_md5(file_bytes)
-                version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
+            valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(file_bytes)
+            if not valid_struct:
+                log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+                raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
                 
-                if not version_info["is_duplicate"]:
-                    db_doc = Document(
-                        name=safe_name,
-                        file_path=temp_path,
-                        status="processing",
-                        approval_status="ACTIVE",
-                        version=version_info["version"],
-                        medical_relevance_score=1.0,
-                        hash_md5=file_hash,
-                        scope="patient",
-                        patient_id=patient_id,
-                        uploaded_by=user.id,
-                        uploader_role=user.role,
-                        document_type="radiology_report"
-                    )
-                    db.add(db_doc)
-                    db.commit()
-                    db.refresh(db_doc)
-                    doc_id = db_doc.id
-                    
-                    background_tasks.add_task(
-                        bg_process_pdf_task,
-                        temp_path,
-                        safe_name,
-                        db_doc.id,
-                        "patient",
-                        patient_id,
-                        version_info["version"],
-                        "radiology_report"
-                    )
-                else:
-                    existing_doc = db.query(Document).filter(Document.hash_md5 == file_hash).first()
-                    if existing_doc:
-                        doc_id = existing_doc.id
-            except Exception:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
+            file_hash = compute_md5(file_bytes)
+            version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope="patient")
+            stored_path = storage.upload(safe_name, file_bytes, content_type="application/pdf")
+            
+            if not version_info["is_duplicate"]:
+                db_doc = Document(
+                    name=safe_name,
+                    file_path=stored_path,
+                    status="processing",
+                    approval_status="ACTIVE",
+                    version=version_info["version"],
+                    medical_relevance_score=1.0,
+                    hash_md5=file_hash,
+                    scope="patient",
+                    patient_id=patient_id,
+                    uploaded_by=user.id,
+                    uploader_role=user.role,
+                    document_type="radiology_report"
+                )
+                db.add(db_doc)
+                db.commit()
+                db.refresh(db_doc)
+                doc_id = db_doc.id
+                
+                background_tasks.add_task(
+                    bg_process_pdf_task,
+                    stored_path,
+                    safe_name,
+                    db_doc.id,
+                    "patient",
+                    patient_id,
+                    version_info["version"],
+                    "radiology_report"
+                )
+            else:
+                existing_doc = db.query(Document).filter(Document.hash_md5 == file_hash).first()
+                if existing_doc:
+                    doc_id = existing_doc.id
         else:
-            image_path = temp_path
+            content_type = file.content_type or "image/png"
+            image_path = storage.upload(safe_name, file_bytes, content_type=content_type)
             
     report = RadiologyReport(
         patient_id=patient_id,
@@ -1280,14 +1314,15 @@ def delete_radiology_record(
         
     patient_id = report.patient_id
     doc_id = report.document_id
+    storage = get_storage()
     
     # 1. If associated document exists, clean DB, vector store, and files
     if doc_id:
         doc = db.query(Document).filter(Document.id == doc_id).first()
         if doc:
-            if doc.file_path and os.path.exists(doc.file_path):
+            if doc.file_path:
                 try:
-                    os.remove(doc.file_path)
+                    storage.delete(doc.file_path)
                 except Exception:
                     pass
             doc.approval_status = "DELETED"
@@ -1300,10 +1335,10 @@ def delete_radiology_record(
             except Exception as e:
                 print(f"Error removing doc {doc.id} from vector store: {e}")
                 
-    # 2. If image file exists on disk, remove it
-    if report.image_path and os.path.exists(report.image_path):
+    # 2. If image file exists on storage, remove it
+    if report.image_path:
         try:
-            os.remove(report.image_path)
+            storage.delete(report.image_path)
         except Exception:
             pass
             
@@ -1482,7 +1517,6 @@ async def upload_file(
     safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', safe_name)
     if scope == "temporary":
         safe_name = f"temp_{uuid.uuid4().hex[:8]}_{safe_name}"
-    temp_path = os.path.join(UPLOAD_DIR, safe_name)
     
     # Free name slot if an old soft-deleted record exists with same name
     existing_name_doc = db.query(Document).filter(Document.name == safe_name).first()
@@ -1491,32 +1525,28 @@ async def upload_file(
             if not existing_name_doc.name.startswith("deleted_"):
                 existing_name_doc.name = f"deleted_{existing_name_doc.id}_{existing_name_doc.name}"
                 db.commit()
-    
-    with open(temp_path, "wb") as f:
-        f.write(file_bytes)
+
+    # 2. Automated PDF Structure & Text Check directly on in-memory bytes
+    valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(file_bytes)
+    if not valid_struct:
+        log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
+        raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
         
-    try:
-        # 2. Automated PDF Structure & Text Check
-        valid_struct, struct_msg, page_count, extracted_text = validate_pdf_structure(temp_path)
-        if not valid_struct:
-            log_audit_event(db, user, "PDF_VALIDATION_FAILED", "document", safe_name, "FAILURE", struct_msg)
-            raise HTTPException(status_code=400, detail=f"PDF Validation Failed: {struct_msg}")
-            
-        # 3. Medical Relevance Evaluation
-        relevance_data = evaluate_medical_relevance(extracted_text)
-        if relevance_data["classification"] == "LOW" and scope == "knowledge_base":
-            log_audit_event(db, user, "MEDICAL_RELEVANCE_REJECTED", "document", safe_name, "DENIED", relevance_data["reason"])
-            raise HTTPException(status_code=400, detail=f"Document Rejected: {relevance_data['reason']}")
-            
-        # 4. Duplicate & Version Check
-        file_hash = compute_md5(file_bytes)
-        version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope=scope)
-        if version_info["is_duplicate"]:
-            raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
-    except Exception:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
+    # 3. Medical Relevance Evaluation
+    relevance_data = evaluate_medical_relevance(extracted_text)
+    if relevance_data["classification"] == "LOW" and scope == "knowledge_base":
+        log_audit_event(db, user, "MEDICAL_RELEVANCE_REJECTED", "document", safe_name, "DENIED", relevance_data["reason"])
+        raise HTTPException(status_code=400, detail=f"Document Rejected: {relevance_data['reason']}")
+        
+    # 4. Duplicate & Version Check
+    file_hash = compute_md5(file_bytes)
+    version_info = detect_version_and_duplicates(safe_name, file_hash, db, Document, target_scope=scope)
+    if version_info["is_duplicate"]:
+        raise HTTPException(status_code=400, detail=f"Upload rejected: {version_info['message']}")
+
+    # Store file via storage provider
+    storage = get_storage()
+    stored_path = storage.upload(safe_name, file_bytes, content_type="application/pdf")
         
     # 5. Approval Workflow state
     # Admin uploads are authoritative (ACTIVE immediately). Doctor uploads go to PENDING for review.
@@ -1527,7 +1557,7 @@ async def upload_file(
         
     db_doc = Document(
         name=safe_name,
-        file_path=temp_path,
+        file_path=stored_path,
         status="processing" if initial_approval == "ACTIVE" else "pending_review",
         approval_status=initial_approval,
         version=version_info["version"],
@@ -1546,7 +1576,7 @@ async def upload_file(
     if initial_approval == "ACTIVE":
         background_tasks.add_task(
             bg_process_pdf_task,
-            temp_path,
+            stored_path,
             safe_name,
             db_doc.id,
             scope,
@@ -1623,10 +1653,10 @@ def delete_document(doc_id: int, admin: User = Depends(require_roles(["ADMIN"]))
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
         
-    # Remove physical file from disk if present
-    if doc.file_path and os.path.exists(doc.file_path):
+    # Remove physical file from storage if present
+    if doc.file_path:
         try:
-            os.remove(doc.file_path)
+            get_storage().delete(doc.file_path)
         except Exception:
             pass
 
@@ -1655,10 +1685,10 @@ def detach_chat_attachment(
     if doc.uploaded_by != user.id and (user.role or "").upper() != "ADMIN":
         raise HTTPException(status_code=403, detail="Permission denied to detach this attachment.")
         
-    # 1. Clean physical file from disk
-    if doc.file_path and os.path.exists(doc.file_path):
+    # 1. Clean physical file from storage
+    if doc.file_path:
         try:
-            os.remove(doc.file_path)
+            get_storage().delete(doc.file_path)
         except Exception:
             pass
             
@@ -1720,27 +1750,26 @@ def get_document_file(
     if doc.scope == "patient" and doc.patient_id:
         verify_patient_access(user, doc.patient_id, db)
         
-    if not doc.file_path or not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=404, detail="Physical document file not found on disk.")
-        
-    lower_path = doc.file_path.lower()
-    if lower_path.endswith(".pdf"):
-        media_type = "application/pdf"
-    elif lower_path.endswith(".txt"):
-        media_type = "text/plain"
-    elif lower_path.endswith(".png"):
-        media_type = "image/png"
-    elif lower_path.endswith(".jpg") or lower_path.endswith(".jpeg"):
-        media_type = "image/jpeg"
-    else:
-        media_type = "application/octet-stream"
-        
+    storage = get_storage()
+    try:
+        stream, media_type, file_size = storage.get_stream(doc.file_path)
+    except (StorageFileNotFoundError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Physical document file not found.")
+    except Exception as e:
+        logger.error(f"Error fetching document stream for doc {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve document file.")
+
     log_audit_event(db, user, "DOCUMENT_FILE_ACCESSED", "document", str(doc.id), "SUCCESS", f"Viewed file {doc.name}")
-    
-    return FileResponse(
-        path=doc.file_path,
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{doc.name}"',
+        "Content-Length": str(file_size),
+    }
+
+    return StreamingResponse(
+        stream,
         media_type=media_type,
-        filename=doc.name
+        headers=headers
     )
 
 # ----------------- TRUSTED SOURCES REGISTRY -----------------

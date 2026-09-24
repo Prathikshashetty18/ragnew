@@ -31,14 +31,21 @@ def test_pipeline_medication_dosage_query():
     assert "ceftriaxone" in evidence_texts.lower() or "antimicrobial" in citation_secs.lower()
 
 def test_pipeline_patient_scope_filter():
-    # Patient P001 scope should only retrieve P001 reports
+    # Scoped patient query should only retrieve chunks for that specific patient
     res = query_pipeline(
-        "What were the chest X-ray findings?",
-        filters={"scope": "patient", "patient_id": "P001"}
+        "What were the clinical assessment and recommendations?",
+        filters={"scope": "patient", "patient_id": "PAT-2026-000101"}
     )
     assert len(res["citations"]) > 0
     for cit in res["citations"]:
-        assert "Report" in cit["pdf_name"] or "Chest" in cit["pdf_name"] or "Blood" in cit["pdf_name"]
+        assert "PAT-2026-000101" in cit["pdf_name"] or "Report" in cit["pdf_name"]
+
+    # Patient isolation: query for an unindexed patient should return 0 citations
+    res_isolated = query_pipeline(
+        "What were the clinical assessment and recommendations?",
+        filters={"scope": "patient", "patient_id": "NONEXISTENT_PATIENT"}
+    )
+    assert len(res_isolated.get("citations", [])) == 0
 
 def test_pipeline_insufficient_evidence():
     # Out-of-corpus query

@@ -1,7 +1,8 @@
+import io
 import os
 import re
 import hashlib
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Union
 from fastapi import HTTPException, status, Request, UploadFile
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
@@ -73,31 +74,42 @@ CLINICAL_LEXICON = {
 def compute_md5(file_bytes: bytes) -> str:
     return hashlib.md5(file_bytes).hexdigest()
 
-def validate_pdf_structure(file_path: str) -> Tuple[bool, str, int, str]:
-    if not os.path.exists(file_path):
-        return False, "File does not exist on disk.", 0, ""
-        
+def validate_pdf_structure(file_or_stream: Union[str, io.BytesIO, bytes]) -> Tuple[bool, str, int, str]:
     try:
-        with open(file_path, "rb") as f:
-            header = f.read(5)
-            if not header.startswith(b"%PDF-"):
-                return False, "Invalid file format: Missing standard PDF header signature.", 0, ""
-                
-        reader = PdfReader(file_path)
+        if isinstance(file_or_stream, bytes):
+            stream = io.BytesIO(file_or_stream)
+        elif isinstance(file_or_stream, io.BytesIO):
+            stream = file_or_stream
+            stream.seek(0)
+        elif isinstance(file_or_stream, str):
+            if not os.path.exists(file_or_stream):
+                return False, "File does not exist on disk.", 0, ""
+            with open(file_or_stream, "rb") as f:
+                stream = io.BytesIO(f.read())
+        else:
+            return False, f"Unsupported file input type: {type(file_or_stream)}", 0, ""
+
+        stream.seek(0)
+        header = stream.read(5)
+        if not header.startswith(b"%PDF-"):
+            return False, "Invalid file format: Missing standard PDF header signature.", 0, ""
+
+        stream.seek(0)
+        reader = PdfReader(stream)
         page_count = len(reader.pages)
         if page_count == 0:
             return False, "Corrupted PDF: Document contains 0 pages.", 0, ""
-            
+
         full_text = []
         for p_idx, page in enumerate(reader.pages):
             text = page.extract_text() or ""
             if text.strip():
                 full_text.append(text)
-                
+
         combined_text = " ".join(full_text).strip()
         if len(combined_text) < 50:
             return False, "Unreadable or empty PDF: Insufficient selectable text extracted (may be an empty scan without OCR).", page_count, ""
-            
+
         return True, "PDF structure verified and selectable text extracted.", page_count, combined_text
     except Exception as e:
         return False, f"Corrupted or unreadable PDF: {str(e)}", 0, ""

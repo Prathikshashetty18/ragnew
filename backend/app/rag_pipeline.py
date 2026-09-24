@@ -16,7 +16,8 @@ import pickle
 import threading
 import uuid
 import math
-from typing import List, Dict, Any, Optional, Tuple, Set
+import io
+from typing import List, Dict, Any, Optional, Tuple, Set, Union
 import numpy as np
 import faiss
 from pypdf import PdfReader
@@ -62,6 +63,7 @@ from app.retrievers import (
     get_cross_encoder_model
 )
 from app.router import MultiRAGRouter
+from app.storage import get_storage
 
 # Thread-safe locks
 _models_lock = threading.Lock()
@@ -143,6 +145,24 @@ def get_vector_store() -> Tuple[faiss.Index, List[Dict[str, Any]], Optional[np.n
         return _faiss_index, list(_chunks_metadata), _embeddings_array
 
 
+def get_indexed_document_ids() -> Set[int]:
+    """
+    Returns the set of document IDs currently represented in the active in-memory vector store.
+    Thread-safe and guaranteed not to mutate shared state.
+    """
+    with _vector_store_lock:
+        _, metadata, _ = get_vector_store()
+        doc_ids: Set[int] = set()
+        for chunk in metadata:
+            doc_id = chunk.get("document_id")
+            if doc_id is not None:
+                try:
+                    doc_ids.add(int(doc_id))
+                except (ValueError, TypeError):
+                    pass
+        return doc_ids
+
+
 def get_bm25_index() -> PersistentBM25Index:
     global _bm25_index
     if _bm25_index is None:
@@ -217,7 +237,7 @@ def split_into_sentences(text: str) -> List[str]:
 
 
 def process_pdf(
-    file_path: str,
+    file_path: Union[str, io.BytesIO, bytes],
     filename: str,
     doc_id: Optional[int] = None,
     scope: str = "knowledge_base",
@@ -229,8 +249,25 @@ def process_pdf(
     Extracts text page-by-page, applies hierarchical chunking with structural context,
     embeds contextualized chunks into FAISS, and updates the persistent BM25 index.
     """
-    print(f"Processing PDF (Multi-RAG): {filename} from {file_path} (scope={scope}, patient={patient_id}, version={version})")
-    reader = PdfReader(file_path)
+    display_path = file_path if isinstance(file_path, str) else "<in-memory stream>"
+    print(f"Processing PDF (Multi-RAG): {filename} from {display_path} (scope={scope}, patient={patient_id}, version={version})")
+
+    if isinstance(file_path, bytes):
+        stream = io.BytesIO(file_path)
+    elif isinstance(file_path, io.BytesIO):
+        stream = file_path
+    elif isinstance(file_path, str):
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                stream = io.BytesIO(f.read())
+        else:
+            storage = get_storage()
+            stream, _, _ = storage.get_stream(file_path)
+    else:
+        raise ValueError(f"Unsupported file input type for process_pdf: {type(file_path)}")
+
+    stream.seek(0)
+    reader = PdfReader(stream)
     all_chunks = []
     chunker = HierarchicalClinicalChunker(chunk_size=RAG_CHUNK_SIZE, chunk_overlap=RAG_CHUNK_OVERLAP)
 

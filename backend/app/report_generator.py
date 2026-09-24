@@ -7,8 +7,13 @@ from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
 from app.database import Patient, PatientVitals, LabResult, RadiologyReport, ClinicalNote, ClinicalReport, Document, User
-from app.rag_pipeline import query_pipeline, call_groq_llm, call_gemini_fallback, index_text_document, remove_document_from_vector_store
+from app.rag_pipeline import (
+    query_pipeline, call_groq_llm, call_gemini_fallback,
+    index_text_document, remove_document_from_vector_store,
+    get_indexed_document_ids
+)
 from app.config import GROQ_API_KEY, UPLOAD_DIR
+from app.storage import get_storage
 
 def _to_clean_text(val: Any) -> str:
     """
@@ -299,23 +304,21 @@ def sync_report_to_knowledge_base(report: ClinicalReport, user: Optional[User], 
         report_text = format_report_to_searchable_text(report, patient)
         
         doc_filename = f"Clinical_Report_{report.patient_id}_Report{report.id}.txt"
-        file_path = os.path.join(UPLOAD_DIR, doc_filename)
+        storage = get_storage()
+        stored_path = storage.upload(doc_filename, report_text.encode("utf-8"), content_type="text/plain")
         
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(report_text)
-            
         file_hash = hashlib.md5(report_text.encode("utf-8")).hexdigest()
         
         # Check if Document record already exists
         existing_doc = db.query(Document).filter(
             (Document.name == doc_filename) | 
-            ((Document.patient_id == report.patient_id) & (Document.document_type == "clinical_report") & (Document.file_path == file_path))
+            ((Document.patient_id == report.patient_id) & (Document.document_type == "clinical_report") & ((Document.file_path == stored_path) | (Document.file_path.like(f"%{doc_filename}"))))
         ).first()
         
         if existing_doc:
             # Remove previous chunks from FAISS and BM25
             remove_document_from_vector_store(existing_doc.id)
-            existing_doc.file_path = file_path
+            existing_doc.file_path = stored_path
             existing_doc.hash_md5 = file_hash
             existing_doc.status = "ready"
             existing_doc.approval_status = "ACTIVE"
@@ -339,7 +342,7 @@ def sync_report_to_knowledge_base(report: ClinicalReport, user: Optional[User], 
         else:
             db_doc = Document(
                 name=doc_filename,
-                file_path=file_path,
+                file_path=stored_path,
                 status="ready",
                 approval_status="ACTIVE",
                 version="1.0",
@@ -379,10 +382,12 @@ def sync_report_to_knowledge_base(report: ClinicalReport, user: Optional[User], 
 def reconcile_unindexed_clinical_reports(db: Session) -> int:
     """
     Scans ClinicalReport rows in the database, checks if the matching Document
-    is missing or has chunk_count == 0, and syncs/indexes it into the Knowledge Base.
+    is missing, has chunk_count == 0, is not ready, or is missing from active
+    vector-store metadata, and syncs/indexes it into the Knowledge Base.
     """
     reconciled_count = 0
     try:
+        indexed_doc_ids = get_indexed_document_ids()
         reports = db.query(ClinicalReport).filter(ClinicalReport.status == "APPROVED").all()
         for report in reports:
             doc_filename = f"Clinical_Report_{report.patient_id}_Report{report.id}.txt"
@@ -391,7 +396,18 @@ def reconcile_unindexed_clinical_reports(db: Session) -> int:
                 ((Document.patient_id == report.patient_id) & (Document.document_type == "clinical_report") & (Document.name.like(f"%Report{report.id}%")))
             ).first()
             
-            if not matching_doc or matching_doc.chunk_count == 0 or matching_doc.status != "ready":
+            # Lifecycle Guard: Never resurrect deleted or archived documents into active Knowledge Base
+            if matching_doc and matching_doc.approval_status in ("DELETED", "ARCHIVED"):
+                continue
+
+            is_unindexed = (
+                not matching_doc
+                or matching_doc.chunk_count == 0
+                or matching_doc.status != "ready"
+                or matching_doc.id not in indexed_doc_ids
+            )
+            
+            if is_unindexed:
                 print(f"Reconciling unindexed clinical report: ID={report.id}, Patient={report.patient_id}")
                 doc = sync_report_to_knowledge_base(report, report.doctor, db)
                 if doc and doc.chunk_count > 0:
